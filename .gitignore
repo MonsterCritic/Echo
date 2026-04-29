@@ -1,0 +1,22 @@
+# Secrets — NEVER commit these
+.env
+
+# User data
+rewrite.log
+dictate_history.md
+
+# Compiled artifacts (build from source via swiftc)
+record.app/
+history_menubar.app/
+dialog_buttons
+hud
+
+# Stray duplicates
+*\ 2.py
+*\ 2.swift
+
+# Editor / OS noise
+.DS_Store
+__pycache__/
+*.pyc
+*.swp
