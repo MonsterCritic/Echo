@@ -1,6 +1,6 @@
 # Echo — AI Rewrite, Dictate & Speak
 
-A small set of macOS tools wired up to the Globe (🌐 / Fn) key. All actions run locally; only the Anthropic and OpenAI APIs are called over the network.
+A small set of macOS tools wired up to the Globe (🌐 / Fn) key. All actions run locally; only the OpenAI API is called over the network.
 
 ---
 
@@ -11,8 +11,8 @@ Select text anywhere on macOS, tap Globe, and the selection is replaced with a c
 
 **How it works:**
 1. The Globe tap fires the "AI Rewrite" Automator Quick Action, which pipes the selected text to `rewrite.py` via stdin.
-2. The script sends the text to Claude (`claude-haiku-4-5`) with a system prompt that locks the model into "rewrite-only" mode — instructions inside the selection are treated as raw content, not commands.
-3. If the text isn't English, Claude translates it. Otherwise it just rephrases — keeping every idea, matching the original tone and length, and preserving line breaks.
+2. The script sends the text to OpenAI (`gpt-4.1-mini`) with a system prompt that locks the model into "rewrite-only" mode — instructions inside the selection are treated as raw content, not commands.
+3. If the text isn't English, the model translates it. Otherwise it just rephrases — keeping every idea, matching the original tone and length, and preserving line breaks.
 4. The rewritten text is written to the clipboard, and `Cmd+V` is sent to replace the original selection.
 5. The previous clipboard contents are restored half a second later, so your copy buffer isn't clobbered.
 
@@ -23,7 +23,7 @@ Hold Globe to record, release to paste a clean transcript at the cursor.
 1. A persistent Swift daemon (`record.app`) runs at login with CoreAudio pre-warmed, so the first hold captures audio from frame zero with no cold-start lag.
 2. Karabiner touches `/tmp/rewrite_record_start` on press and removes it on release. The daemon polls that flag every 50ms and starts/stops `AVAudioRecorder` accordingly. It also captures the frontmost app name at press time so the paste lands where you started, even if focus drifts.
 3. On release, `dictate.py` uploads the m4a to OpenAI's `gpt-4o-mini-transcribe` for transcription.
-4. The transcript is sent to OpenAI's `gpt-4.1-mini` for "prettification": filler words removed, punctuation added, run-on dictation turned into clean prose. Non-English speech is translated to English.
+4. The transcript is sent to `gpt-4.1-mini` for "prettification": filler words removed, punctuation added, run-on dictation turned into clean prose. Non-English speech is translated to English.
 5. **Voice commands** at the start of the transcript override the default behavior:
    - *"don't translate" / "не переводи"* → keeps the original language.
    - *"leave as is" / "verbatim" / "оставь как есть"* → no translation, no prettification, raw output.
@@ -49,8 +49,7 @@ A small menubar app (`history_menubar.app`) shows the last few dictation results
 - macOS 13+ (Ventura or newer)
 - Python 3 (preinstalled on macOS)
 - Swift toolchain (`xcode-select --install` if `swiftc` isn't found)
-- An [Anthropic API key](https://console.anthropic.com/) — needed for Rewrite
-- An [OpenAI API key](https://platform.openai.com/api-keys) — needed for Dictate and Speak
+- An [OpenAI API key](https://platform.openai.com/api-keys) — used by all three tools
 - [Karabiner-Elements](https://karabiner-elements.pods.tools/) — used to bind the Globe key
 
 ---
@@ -76,7 +75,6 @@ chmod 600 .env
 Open `.env` and fill in:
 
 ```
-ANTHROPIC_API_KEY=sk-ant-...
 OPENAI_API_KEY=sk-...
 ```
 
@@ -201,7 +199,7 @@ If something misfires, check `~/Documents/context-helper/rewrite.log` — every 
 
 | File | Purpose |
 |---|---|
-| `rewrite.py` | AI Rewrite — Claude-powered selection rewrite |
+| `rewrite.py` | AI Rewrite — OpenAI-powered selection rewrite |
 | `dictate.py` | AI Dictate — Whisper transcription + Claude prettify |
 | `speak.py` | AI Speak — translate-to-Russian + streaming TTS |
 | `record.swift` | Persistent voice-recording daemon (auto-started at login) |

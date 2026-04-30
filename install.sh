@@ -12,10 +12,10 @@ CONTENTS_DIR="$WORKFLOW_DIR/Contents"
 ENV_FILE="$SCRIPT_DIR/.env"
 if [ ! -f "$ENV_FILE" ]; then
     echo ""
-    echo "No .env file found. Enter your Anthropic API key (or press Enter to skip):"
-    read -r -p "ANTHROPIC_API_KEY= " key
+    echo "No .env file found. Enter your OpenAI API key (or press Enter to skip):"
+    read -r -p "OPENAI_API_KEY= " key
     if [ -n "$key" ]; then
-        echo "ANTHROPIC_API_KEY=$key" > "$ENV_FILE"
+        echo "OPENAI_API_KEY=$key" > "$ENV_FILE"
         chmod 600 "$ENV_FILE"
         echo "Saved to $ENV_FILE"
     else

@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-AI Rewrite — reads selected text from stdin, rewrites via Claude, pastes result.
+AI Rewrite — reads selected text from stdin, rewrites via OpenAI, pastes result.
 """
 from __future__ import annotations
 import sys
@@ -16,7 +16,7 @@ from datetime import datetime
 SCRIPT_DIR  = os.path.dirname(os.path.abspath(__file__))
 CONFIG_PATH = os.path.join(SCRIPT_DIR, ".env")
 LOG_PATH    = os.path.join(SCRIPT_DIR, "rewrite.log")
-MODEL       = "claude-haiku-4-5-20251001"
+MODEL       = "gpt-4.1-mini"
 
 SYSTEM_PROMPT = (
     "You are a text-rewriting engine. You do not converse, answer questions, "
@@ -79,37 +79,38 @@ display dialog "{safe}" ¬
 
 
 def get_api_key() -> str | None:
-    key = os.environ.get("ANTHROPIC_API_KEY", "").strip()
+    key = os.environ.get("OPENAI_API_KEY", "").strip()
     if key:
         return key
     if os.path.exists(CONFIG_PATH):
         with open(CONFIG_PATH) as f:
             for line in f:
                 line = line.strip()
-                if line.startswith("ANTHROPIC_API_KEY="):
+                if line.startswith("OPENAI_API_KEY="):
                     return line.split("=", 1)[1].strip().strip("\"'")
     return None
 
 
-def call_claude(api_key: str, text: str) -> str:
+def call_openai(api_key: str, text: str) -> str:
     payload = {
         "model": MODEL,
         "max_tokens": 4096,
-        "system": SYSTEM_PROMPT,
-        "messages": [{"role": "user", "content": f"<rewrite>\n{text}\n</rewrite>"}],
+        "messages": [
+            {"role": "system", "content": SYSTEM_PROMPT},
+            {"role": "user",   "content": f"<rewrite>\n{text}\n</rewrite>"},
+        ],
     }
     req = urllib.request.Request(
-        "https://api.anthropic.com/v1/messages",
+        "https://api.openai.com/v1/chat/completions",
         data=json.dumps(payload).encode(),
         headers={
-            "x-api-key": api_key,
-            "anthropic-version": "2023-06-01",
-            "content-type": "application/json",
+            "Authorization": f"Bearer {api_key}",
+            "Content-Type":  "application/json",
         },
     )
     with urllib.request.urlopen(req, timeout=60) as resp:
         data = json.load(resp)
-        return data["content"][0]["text"]
+        return data["choices"][0]["message"]["content"]
 
 
 def get_frontmost_process() -> str:
@@ -160,12 +161,12 @@ def main():
     api_key = get_api_key()
     if not api_key:
         log("No API key found")
-        show_error(f"ANTHROPIC_API_KEY not set.\n\nAdd it to:\n{CONFIG_PATH}")
+        show_error(f"OPENAI_API_KEY not set.\n\nAdd it to:\n{CONFIG_PATH}")
         return
 
     try:
         log(f"INPUT: {repr(selected)}")
-        result = call_claude(api_key, selected)
+        result = call_openai(api_key, selected)
         log(f"Success — got {len(result)} chars back")
         log(f"OUTPUT: {repr(result)}")
 
