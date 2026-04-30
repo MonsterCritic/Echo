@@ -1,6 +1,6 @@
 # Echo — AI Rewrite, Dictate & Speak
 
-A small set of macOS tools wired up to the Globe (🌐 / Fn) key. All actions run locally; only the OpenAI API is called over the network.
+A small set of macOS tools wired up to the Globe (🌐 / Fn) key. All actions run locally on your Mac; only the OpenAI API is called over the network.
 
 ---
 
@@ -10,9 +10,9 @@ A small set of macOS tools wired up to the Globe (🌐 / Fn) key. All actions ru
 Select text anywhere on macOS, tap Globe, and the selection is replaced with a cleaned-up version.
 
 **How it works:**
-1. The Globe tap fires the "AI Rewrite" Automator Quick Action, which pipes the selected text to `rewrite.py` via stdin.
+1. Tapping Globe runs `rewrite_selection.sh`, which sends `Cmd+C` to grab the current selection, then pipes it to `rewrite.py` via stdin.
 2. The script sends the text to OpenAI (`gpt-4.1-mini`) with a system prompt that locks the model into "rewrite-only" mode — instructions inside the selection are treated as raw content, not commands.
-3. If the text isn't English, the model translates it. Otherwise it just rephrases — keeping every idea, matching the original tone and length, and preserving line breaks.
+3. If the text isn't English, the model translates it. Otherwise it just rephrases — keeping every idea, matching the original tone and length, preserving line breaks.
 4. The rewritten text is written to the clipboard, and `Cmd+V` is sent to replace the original selection.
 5. The previous clipboard contents are restored half a second later, so your copy buffer isn't clobbered.
 
@@ -21,11 +21,11 @@ Hold Globe to record, release to paste a clean transcript at the cursor.
 
 **How it works:**
 1. A persistent Swift daemon (`record.app`) runs at login with CoreAudio pre-warmed, so the first hold captures audio from frame zero with no cold-start lag.
-2. Karabiner touches `/tmp/rewrite_record_start` on press and removes it on release. The daemon polls that flag every 50ms and starts/stops `AVAudioRecorder` accordingly. It also captures the frontmost app name at press time so the paste lands where you started, even if focus drifts.
-3. On release, `dictate.py` uploads the m4a to OpenAI's `gpt-4o-mini-transcribe` for transcription.
-4. The transcript is sent to `gpt-4.1-mini` for "prettification": filler words removed, punctuation added, run-on dictation turned into clean prose. Non-English speech is translated to English.
+2. Karabiner touches `/tmp/rewrite_record_start` on press and removes it on release. The daemon polls that flag every 50 ms and starts/stops `AVAudioRecorder` accordingly. It also captures the frontmost app name at press time so the paste lands where you started, even if focus drifts.
+3. On release, `dictate.py` uploads the m4a to OpenAI's `gpt-4o-mini-transcribe`.
+4. The transcript is sent to `gpt-4.1-mini` for prettification: filler words removed, punctuation added, run-on dictation turned into clean prose. Non-English speech is translated to English.
 5. **Voice commands** at the start of the transcript override the default behavior:
-   - *"don't translate" / "не переводи"* → keeps the original language.
+   - *"don't translate" / "не переводи"* → keep the original language.
    - *"leave as is" / "verbatim" / "оставь как есть"* → no translation, no prettification, raw output.
 6. The result is written to a markdown history file (`dictate_history.md`) **before** pasting — so even if the paste lands in the wrong window, the text is recoverable.
 7. The original frontmost app is brought back to front, then `Cmd+V` is sent. The clipboard is held for 5 seconds afterward so you can manually paste again if the auto-paste missed the input.
@@ -44,154 +44,76 @@ A small menubar app (`history_menubar.app`) shows the last few dictation results
 
 ---
 
-## Requirements
+## Install
 
-- macOS 13+ (Ventura or newer)
-- Python 3 (preinstalled on macOS)
-- Swift toolchain (`xcode-select --install` if `swiftc` isn't found)
-- An [OpenAI API key](https://platform.openai.com/api-keys) — used by all three tools
-- [Karabiner-Elements](https://karabiner-elements.pods.tools/) — used to bind the Globe key
+### Can Claude Code do this for me?
 
----
+**Mostly, but not entirely.** Claude Code can run `setup.sh` and verify the build, which covers ~90% of the install. It **cannot**:
 
-## Step-by-step install
+- Install Karabiner-Elements (signed installer + macOS input-monitoring approval).
+- Enable the imported rule inside the Karabiner-Elements app.
+- Click through the macOS permission prompts (Microphone, Accessibility, Automation).
 
-### 1. Clone the repo
+Hand the README to Claude Code and the automated half completes in seconds; the manual half takes about two minutes.
+
+### Prereqs (one-time, manual)
+
+1. **Xcode command-line tools** (provides `swiftc`):
+   ```sh
+   xcode-select --install
+   ```
+2. **Karabiner-Elements** — download and install from <https://karabiner-elements.pqrs.org/>.
+3. **OpenAI API key** — get one at <https://platform.openai.com/api-keys>.
+
+### Automated install
 
 ```sh
 git clone git@github.com:MonsterCritic/Echo.git ~/Documents/context-helper
 cd ~/Documents/context-helper
+./setup.sh
 ```
 
-### 2. Add your API keys
+`setup.sh` prompts for your OpenAI key (skip and add later if you prefer) and then:
 
-Create a `.env` file in the repo root:
+- Compiles `record.swift` and `history_menubar.swift` into `.app` bundles.
+- Compiles `hud.swift` and `dialog_buttons.swift`.
+- Installs the AI Rewrite Quick Action at `~/Library/Services/AI Rewrite.workflow`.
+- Registers the recorder daemon as a LaunchAgent (auto-starts at login).
+- Drops the Karabiner rule into `~/.config/karabiner/assets/complex_modifications/echo.json`.
 
+If you skipped the API-key prompt, add it now:
 ```sh
-cp .env.example .env
-chmod 600 .env
+echo 'OPENAI_API_KEY=sk-...' > .env && chmod 600 .env
 ```
 
-Open `.env` and fill in:
+### Finish (manual — these need GUI clicks)
 
-```
-OPENAI_API_KEY=sk-...
-```
+These three steps cannot be scripted. macOS won't let any tool grant input-monitoring or permission-dialog approvals on your behalf.
 
-### 3. Install the AI Rewrite Quick Action
+1. **Enable the Karabiner rule:** open Karabiner-Elements → *Complex Modifications* → *Add predefined rule* → enable **"Echo (AI Rewrite / Dictate / Speak)"**.
 
-```sh
-./install.sh
-```
+2. **Approve permission prompts** the first time you tap or hold Globe. macOS will ask for:
+   - **Microphone** — the recorder daemon.
+   - **Accessibility** — Karabiner-Elements and `osascript` (used to send Cmd+C / Cmd+V).
+   - **Automation** — allow your shell / Terminal to control "System Events".
 
-This creates `~/Library/Services/AI Rewrite.workflow` and reloads the Services menu.
+   You can pre-approve them in *System Settings → Privacy & Security*.
 
-### 4. Build the recorder daemon and helper binaries
+3. **(Optional) Run the history menubar app:**
+   ```sh
+   open ~/Documents/context-helper/history_menubar.app
+   ```
+   Add it to *System Settings → General → Login Items* if you want it auto-started.
 
-```sh
-swiftc -O record.swift -o record.app/Contents/MacOS/record
-swiftc -O history_menubar.swift -o history_menubar.app/Contents/MacOS/history_menubar
-swiftc -O dialog_buttons.swift -o dialog_buttons
-swiftc -O hud.swift -o hud
-```
+### Verify
 
-(The `.app` bundle directories already exist in the repo — only the inner binaries need to be rebuilt.)
+| Tool | How to test | Expected |
+|---|---|---|
+| Rewrite | Select any text, tap Globe | Selection replaced within ~1 s |
+| Dictate | Focus a text input, hold Globe, speak, release | Transcript pasted at cursor |
+| Speak | Select an English sentence, press Cmd+Globe | Russian audio plays |
 
-### 5. Auto-start the recorder daemon at login
-
-Create a LaunchAgent so the recorder is always running and the first Globe-hold has zero cold-start lag:
-
-```sh
-mkdir -p ~/Library/LaunchAgents
-cat > ~/Library/LaunchAgents/com.sergeyshmidt.context-helper.record.plist <<EOF
-<?xml version="1.0" encoding="UTF-8"?>
-<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
-<plist version="1.0">
-<dict>
-    <key>Label</key>
-    <string>com.sergeyshmidt.context-helper.record</string>
-    <key>ProgramArguments</key>
-    <array>
-        <string>$HOME/Documents/context-helper/record.app/Contents/MacOS/record</string>
-    </array>
-    <key>RunAtLoad</key><true/>
-    <key>KeepAlive</key><true/>
-    <key>StandardOutPath</key><string>/tmp/record.out.log</string>
-    <key>StandardErrorPath</key><string>/tmp/record.err.log</string>
-</dict>
-</plist>
-EOF
-
-launchctl load ~/Library/LaunchAgents/com.sergeyshmidt.context-helper.record.plist
-```
-
-### 6. Grant macOS permissions
-
-The first time each tool runs, macOS will prompt for permissions. Approve them in **System Settings → Privacy & Security**:
-
-- **Microphone** — for the recorder (`record`).
-- **Accessibility** — for Karabiner-Elements and `osascript` (used to send Cmd+V and re-focus the original app).
-- **Automation** — allow Terminal/iTerm/your shell to control "System Events" and "Finder".
-
-If a tool seems to do nothing, check Console.app for permission denials.
-
-### 7. Configure Karabiner-Elements
-
-Install Karabiner-Elements from the link above, then add a Complex Modification rule that binds the Globe key:
-
-- **Tap Globe** → run `~/Documents/context-helper/rewrite.py` as a shell command (or invoke the "AI Rewrite" service via a keyboard shortcut you assign in System Settings → Keyboard → Keyboard Shortcuts → Services).
-- **Hold Globe** → on press: `touch /tmp/rewrite_record_start && echo "<frontmost-app-name>" > /tmp/rewrite_record_app.txt`. On release: `rm /tmp/rewrite_record_start && python3 ~/Documents/context-helper/dictate.py`.
-- **Cmd+Globe** → `python3 ~/Documents/context-helper/speak.py`.
-
-A minimal Karabiner rule looks like this (paste into `~/.config/karabiner/assets/complex_modifications/echo.json` and import via Karabiner's GUI):
-
-```json
-{
-  "title": "Echo (AI Rewrite / Dictate / Speak)",
-  "rules": [
-    {
-      "description": "Hold Globe → dictate, tap Globe → rewrite, Cmd+Globe → speak",
-      "manipulators": [
-        {
-          "type": "basic",
-          "from": { "key_code": "fn", "modifiers": { "optional": ["any"] } },
-          "to": [
-            { "shell_command": "/usr/bin/touch /tmp/rewrite_record_start && /bin/bash -c 'osascript -e \"tell application \\\"System Events\\\" to name of first process whose frontmost is true\" > /tmp/rewrite_record_app.txt'" }
-          ],
-          "to_if_alone": [
-            { "shell_command": "pbpaste | /usr/bin/python3 $HOME/Documents/context-helper/rewrite.py" }
-          ],
-          "to_after_key_up": [
-            { "shell_command": "/bin/rm -f /tmp/rewrite_record_start && /usr/bin/python3 $HOME/Documents/context-helper/dictate.py" }
-          ]
-        }
-      ]
-    }
-  ]
-}
-```
-
-> The "tap Globe" path here pipes `pbpaste` for testing. If you want the tap to read the *current selection* (not the clipboard), assign a keyboard shortcut to the "AI Rewrite" service in **System Settings → Keyboard → Keyboard Shortcuts → Services**, then have Karabiner trigger that shortcut instead.
-
-### 8. (Optional) Run the menubar history app
-
-`history_menubar.app` displays the last few dictation results so you can recover anything that didn't land in the right window:
-
-```sh
-open ~/Documents/context-helper/history_menubar.app
-```
-
-Add it to **System Settings → General → Login Items** if you want it to auto-start.
-
----
-
-## Verify it works
-
-1. **Rewrite** — select some text in any app, tap Globe. It should be replaced with a rewritten version within ~1s.
-2. **Dictate** — focus a text input, hold Globe, speak a sentence, release. The transcript should be pasted at the cursor.
-3. **Speak** — select an English sentence, press Cmd+Globe. You should hear the Russian translation read aloud.
-
-If something misfires, check `~/Documents/context-helper/rewrite.log` — every action logs its inputs, outputs, and timing.
+If a tool misfires, check `~/Documents/context-helper/rewrite.log` — every action logs its inputs, outputs, and timing.
 
 ---
 
@@ -200,22 +122,26 @@ If something misfires, check `~/Documents/context-helper/rewrite.log` — every 
 | File | Purpose |
 |---|---|
 | `rewrite.py` | AI Rewrite — OpenAI-powered selection rewrite |
-| `dictate.py` | AI Dictate — Whisper transcription + Claude prettify |
+| `rewrite_selection.sh` | Karabiner wrapper: grabs the selection via Cmd+C, then runs `rewrite.py` |
+| `dictate.py` | AI Dictate — Whisper transcription + prettification |
 | `speak.py` | AI Speak — translate-to-Russian + streaming TTS |
 | `record.swift` | Persistent voice-recording daemon (auto-started at login) |
 | `history_menubar.swift` | Menubar app showing recent dictation history |
 | `hud.swift`, `dialog_buttons.swift` | Small UI helpers |
-| `install.sh` | Installs the AI Rewrite Automator Quick Action |
-| `.env.example` | Template for API keys |
+| `setup.sh` | One-shot installer for everything automatable |
+| `install.sh` | Installs only the AI Rewrite Automator Quick Action (called by `setup.sh`) |
+| `.env.example` | Template for the OpenAI API key |
 
 ---
 
 ## Uninstall
 
 ```sh
-launchctl unload ~/Library/LaunchAgents/com.sergeyshmidt.context-helper.record.plist
-rm ~/Library/LaunchAgents/com.sergeyshmidt.context-helper.record.plist
+launchctl unload ~/Library/LaunchAgents/com.echo.context-helper.record.plist 2>/dev/null
+rm -f ~/Library/LaunchAgents/com.echo.context-helper.record.plist
 rm -rf "$HOME/Library/Services/AI Rewrite.workflow"
+rm -f ~/.config/karabiner/assets/complex_modifications/echo.json
+rm -rf ~/Documents/context-helper
 ```
 
-Then remove the Karabiner rule from Karabiner-Elements' Complex Modifications panel.
+Then disable / remove the rule in Karabiner-Elements → Complex Modifications.
