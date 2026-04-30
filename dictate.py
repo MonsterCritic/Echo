@@ -265,7 +265,7 @@ def main():
     if not wait_for_ready(timeout_s=2.0):
         log("Daemon didn't flush within 2s — is record.app running?")
         show_error("Recorder daemon not responding.\nRun: launchctl kickstart "
-                   "gui/$(id -u)/com.sergeyshmidt.context-helper.record")
+                   "gui/$(id -u)/com.echo.context-helper.record")
         return
 
     # Consume the ready flag so next session starts clean.
