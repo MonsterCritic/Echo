@@ -223,8 +223,16 @@ def activate_process(name: str):
 tell application "System Events"
     set frontmost of first process whose name is "{safe}" to true
 end tell
-delay 0.15
+delay 0.4
 ''')
+
+
+def get_frontmost_process_name() -> str:
+    """Diagnostic: log which app is frontmost right before paste fires."""
+    _, out, _ = run_applescript(
+        'tell application "System Events" to return name of first process whose frontmost is true'
+    )
+    return out.strip()
 
 
 def read_target_app() -> str | None:
@@ -315,9 +323,20 @@ def main():
         else:
             log("no target-app capture found, pasting into current frontmost")
 
-        time.sleep(0.1)
+        # Extra settle time — Electron apps (Claude Desktop, VS Code, etc.)
+        # can take 200–400ms after their main process is brought to front
+        # before the input field's caret is actually re-focused. Sending
+        # Cmd+V too early goes nowhere.
+        time.sleep(0.3)
+        front_now = get_frontmost_process_name()
+        log(f"frontmost just before paste: {front_now}")
         paste()
-        time.sleep(0.5)
+
+        # Keep the dictated text on the clipboard for several seconds so the
+        # user can manually Cmd+V if the auto-paste missed the input. The
+        # menubar history icon is the longer-term safety net, but this
+        # window covers the immediate "paste didn't take, try again" case.
+        time.sleep(5.0)
         write_clipboard(saved)
 
     except urllib.error.HTTPError as e:

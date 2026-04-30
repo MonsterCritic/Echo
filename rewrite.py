@@ -169,18 +169,27 @@ def main():
         log(f"Success — got {len(result)} chars back")
         log(f"OUTPUT: {repr(result)}")
 
-        # Automator (Quick Action: "receives selected text") replaces the
-        # selection with whatever we write to stdout. That's the primary
-        # insertion path — writing an empty stdout would wipe out anything
-        # we paste, so we must always write the result here.
+        # The Quick Action's serviceOutputMechanism is not "replace
+        # selected text", so stdout is discarded — Cmd+V is the only
+        # actual insertion path. Keep the stdout write as a no-op for
+        # cases where someone reconfigures the workflow.
         sys.stdout.write(result)
         sys.stdout.flush()
 
-        # Belt-and-suspenders: also paste via clipboard for apps where the
-        # service's text-replacement doesn't work reliably.
         write_clipboard(result)
+
+        # Re-activate the original app ONLY if focus has drifted. In
+        # Electron apps (Claude desktop, etc.) even a no-op "set
+        # frontmost to true" triggers a re-focus cycle that drops the
+        # input field's selection. With selection gone, Cmd+V appends
+        # instead of replacing, leaving the user with the original text
+        # AND the rewritten text side-by-side.
         if original_process:
-            activate_process(original_process)
+            current_front = get_frontmost_process()
+            if current_front != original_process:
+                log(f"focus drifted: {current_front} → reactivating {original_process}")
+                activate_process(original_process)
+
         log("Pasting...")
         paste()
         log("Paste sent")
