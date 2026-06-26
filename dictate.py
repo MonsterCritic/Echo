@@ -13,6 +13,7 @@ import subprocess
 import json
 import time
 import tempfile
+import threading
 import urllib.request
 import urllib.error
 from datetime import datetime
@@ -24,6 +25,7 @@ HISTORY_PATH = os.path.join(SCRIPT_DIR, "dictate_history.md")
 
 AUDIO_PATH  = "/tmp/rewrite_record.m4a"
 READY_FLAG  = "/tmp/rewrite_record.ready"
+START_FLAG  = "/tmp/rewrite_record_start"
 TARGET_APP  = "/tmp/rewrite_record_app.txt"
 
 OPENAI_TRANSCRIBE_MODEL = "gpt-4o-mini-transcribe"
@@ -108,13 +110,18 @@ def load_env(name: str) -> str | None:
 
 # ── Daemon coordination ───────────────────────────────────────────────────────
 
-def wait_for_ready(timeout_s: float = 2.0) -> bool:
-    """Block until the recorder daemon touches the ready flag (meaning it
-    flushed the m4a to disk and is done with this session). Returns True if
-    the flag appeared in time, False on timeout."""
+def wait_for_release(timeout_s: float = 120.0) -> bool:
+    """Block until the user releases the key and the recorder has flushed.
+
+    The clean "released" signal is: ready flag present AND start flag absent.
+    During the hold the start flag is present, so a stale ready flag left over
+    from a crashed prior session can't trigger us early — we only proceed once
+    Karabiner has removed the start flag (release) and the daemon has written a
+    fresh ready flag (m4a flushed). Returns False on timeout (no real
+    dictation happened)."""
     deadline = time.time() + timeout_s
     while time.time() < deadline:
-        if os.path.exists(READY_FLAG):
+        if os.path.exists(READY_FLAG) and not os.path.exists(START_FLAG):
             return True
         time.sleep(0.03)
     return False
@@ -282,40 +289,31 @@ display dialog "{safe}" with title "AI Dictate — Error" buttons {{"OK"}} defau
 ''')
 
 
-# ── Main ──────────────────────────────────────────────────────────────────────
+# ── Pipeline ────────────────────────────────────────────────────────────────
 
-def main():
-    t0 = time.monotonic()
-    log("STOP fired")
-
-    # Wake System Events now so its ~1.5–2s cold-start overlaps the API
-    # round-trips below instead of landing on the paste at the end.
-    prewarm_system_events()
-
-    # How long ago did the recording actually stop? The m4a is finalized by
-    # the daemon the moment the key is released, so its age here ≈ the lag
-    # between "user let go" and "this script started running" (Karabiner
-    # dispatch + python launch). Lets us see latency the rest of the log
-    # can't, since every other timestamp is relative to this script.
+def _delayed_restore(saved: str, clean: str):
+    """Keep the dictated text on the clipboard for a few seconds so the user
+    can manually Cmd+V if the auto-paste missed, then restore their previous
+    clipboard. Only restore if our text is still there — if a newer dictation
+    or a manual copy took over, leave it alone. Runs in a (non-daemon) thread
+    so the warm worker's loop stays responsive for back-to-back dictations
+    instead of blocking on the 5s hold."""
+    time.sleep(5.0)
     try:
-        rec_age = time.time() - os.path.getmtime(AUDIO_PATH)
-        log(f"recording finalized {rec_age:.2f}s before script start")
+        if read_clipboard() == clean:
+            write_clipboard(saved)
     except Exception:
         pass
 
-    # Karabiner only invokes us when the start flag existed (i.e. a real
-    # dictation session was in progress), so we can assume the daemon is
-    # flushing. Wait briefly for the ready flag to confirm.
-    if not wait_for_ready(timeout_s=2.0):
-        log("Daemon didn't flush within 2s — is record.app running?")
-        show_error("Recorder daemon not responding.\nRun: launchctl kickstart "
-                   "gui/$(id -u)/com.echo.context-helper.record")
-        return
 
-    # Consume the ready flag so next session starts clean.
-    try: os.remove(READY_FLAG)
-    except Exception: pass
-
+def process_dictation(t0: float):
+    """Run the full pipeline assuming the m4a is finalized and the ready flag
+    has already been consumed by the caller. t0 is the monotonic clock at the
+    moment the recording stopped, for latency logging."""
+    # Wake System Events so its cold-start overlaps the API calls below rather
+    # than landing on the paste. (The hold-time osascript usually warms it
+    # already, but this covers the case where it went cold.)
+    prewarm_system_events()
     play_sound("Morse")
 
     if not os.path.exists(AUDIO_PATH):
@@ -370,14 +368,11 @@ def main():
         else:
             log("no target-app capture found, pasting into current frontmost")
             paste()
-        log(f"PASTE DONE — total script time [+{time.monotonic()-t0:.2f}s]")
+        log(f"PASTE DONE — total time [+{time.monotonic()-t0:.2f}s]")
 
-        # Keep the dictated text on the clipboard for several seconds so the
-        # user can manually Cmd+V if the auto-paste missed the input. The
-        # menubar history icon is the longer-term safety net, but this
-        # window covers the immediate "paste didn't take, try again" case.
-        time.sleep(5.0)
-        write_clipboard(saved)
+        # Non-daemon thread: in one-shot mode it keeps the process alive until
+        # the restore fires; in watch mode the loop carries on immediately.
+        threading.Thread(target=_delayed_restore, args=(saved, clean)).start()
 
     except urllib.error.HTTPError as e:
         body = e.read().decode()[:300]
@@ -386,6 +381,42 @@ def main():
     except Exception as e:
         log(f"Exception: {e}")
         show_error(f"Error:\n{str(e)[:200]}")
+
+
+# ── Entry point ───────────────────────────────────────────────────────────────
+
+def main():
+    """Pre-forked at hold-start by Karabiner (~300ms into the hold), NOT on
+    release. We launch here, warm up the interpreter + System Events while the
+    user is still speaking, and block in wait_for_release until the recorder
+    flushes on release — then process immediately. This hides the ~1.6s cold
+    python launch inside the hold instead of paying it after the key is let go.
+
+    Launching via Karabiner (the user's login session) also keeps ~/Documents
+    readable; a launchd agent would be TCC-blocked from reading .env / the log.
+    """
+    log("LAUNCH (hold start) — warming up")
+    prewarm_system_events()
+
+    # Block until release. Timeout is generous because it spans the entire
+    # hold; a real hold is seconds, and if nothing arrives the user never
+    # actually dictated, so we just exit.
+    if not wait_for_release(timeout_s=120.0):
+        log("no recording within 120s — exiting")
+        return
+
+    t0 = time.monotonic()   # ≈ the moment the key was released
+    try:
+        rec_age = time.time() - os.path.getmtime(AUDIO_PATH)
+        log(f"released — recording finalized {rec_age:.2f}s ago (pre-warmed)")
+    except Exception:
+        pass
+
+    # Consume the ready flag so the next session starts clean.
+    try: os.remove(READY_FLAG)
+    except Exception: pass
+
+    process_dictation(t0)
 
 
 if __name__ == "__main__":
