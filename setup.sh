@@ -79,6 +79,10 @@ swiftc -O history_menubar.swift -o history_menubar.app/Contents/MacOS/history_me
 echo "Building helper binaries…"
 swiftc -O hud.swift -o hud
 swiftc -O dialog_buttons.swift -o dialog_buttons
+# paste_helper sends Cmd+V via CGEvent (no System Events), keeping AI Dictate's
+# paste fast and load-immune. Ad-hoc sign so it can hold an Accessibility grant.
+swiftc -O paste_helper.swift -o paste_helper
+codesign -s - -f paste_helper 2>/dev/null || true
 
 # ── 6. Make scripts executable ───────────────────────────────────────────────
 chmod +x rewrite_selection.sh rewrite.py dictate.py speak.py install.sh
@@ -165,7 +169,9 @@ THESE THREE STEPS REQUIRE GUI CLICKS — they cannot be scripted:
 
 3. The first time you tap or hold Globe, macOS will prompt for:
    • Microphone        (the recorder daemon)
-   • Accessibility     (Karabiner-Elements and osascript)
+   • Accessibility     (Karabiner-Elements, osascript, AND paste_helper —
+                        paste_helper needs it to send Cmd+V; until granted,
+                        Dictate falls back to a slower osascript paste)
    • Automation        (allow your shell to control "System Events")
    Approve all of them.
 

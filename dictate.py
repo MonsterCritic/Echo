@@ -27,6 +27,7 @@ AUDIO_PATH  = "/tmp/rewrite_record.m4a"
 READY_FLAG  = "/tmp/rewrite_record.ready"
 START_FLAG  = "/tmp/rewrite_record_start"
 TARGET_APP  = "/tmp/rewrite_record_app.txt"
+PASTE_HELPER = os.path.join(SCRIPT_DIR, "paste_helper")
 
 OPENAI_TRANSCRIBE_MODEL = "gpt-4o-mini-transcribe"
 OPENAI_PRETTIFY_MODEL   = "gpt-4.1-mini"
@@ -213,6 +214,25 @@ def write_clipboard(text: str):
     subprocess.run(["pbcopy"], input=text, text=True)
 
 
+def prewarm_paste_helper():
+    """Fire paste_helper in --check mode at hold-start so its dyld closure and
+    AppKit init are warm by the time we paste on release. The first launch of a
+    freshly-built or long-idle helper costs ~1.2s (one-time); warming it during
+    the hold hides that, the same way the python pre-fork hides its own cold
+    launch. Non-blocking, best-effort."""
+    if not os.path.exists(PASTE_HELPER):
+        return
+    try:
+        subprocess.Popen(
+            [PASTE_HELPER, "--check"],
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
+    except Exception:
+        pass
+
+
 def prewarm_system_events():
     """Fire a throwaway osascript immediately on key release so the shared
     System Events process is launched/awake by the time we paste.
@@ -243,18 +263,49 @@ end tell
 
 
 def focus_target_and_paste(target: str) -> str:
-    """Check the frontmost app, bring `target` forward only if focus drifted,
-    then send Cmd+V — all in a SINGLE osascript pass.
+    """Bring `target` forward (only if focus drifted) and send Cmd+V. Returns
+    the app that was frontmost before pasting, for logging.
 
-    Each osascript spawned from the hotkey context pays a ~1–1.5s cold cost to
-    connect to System Events, so doing the frontmost-check, the conditional
-    reactivation, and the paste as three separate calls was the bulk of the
-    post-transcription delay. One call pays that cost once.
+    Prefers the compiled CGEvent helper (paste_helper), which has no System
+    Events dependency and so stays ~instant regardless of system load. Falls
+    back to the osascript path if the helper is missing or not yet granted
+    Accessibility — so dictation keeps working before the one-time grant."""
+    ok, front_before = _paste_via_helper(target)
+    if ok:
+        return front_before
+    return _paste_via_osascript(target)
 
-    Reactivation is conditional because an unconditional "set frontmost to
-    true" on an Electron app (Claude Desktop, VS Code) kicks off a slow
-    re-focus cycle that can drop the input caret. Returns the app that was
-    frontmost before we pasted, for logging."""
+
+def _paste_via_helper(target: str) -> tuple[bool, str]:
+    """Try the CGEvent helper. Returns (ok, frontmost_before). ok is False if
+    the helper is absent, not Accessibility-trusted (exit 2), or errors — the
+    caller then falls back to osascript."""
+    if not os.path.exists(PASTE_HELPER):
+        return (False, "")
+    try:
+        r = subprocess.run([PASTE_HELPER, target or ""],
+                           capture_output=True, text=True, timeout=10)
+    except Exception as e:
+        log(f"paste_helper error: {e}")
+        return (False, "")
+    if r.returncode != 0:
+        if "ACCESSIBILITY_NOT_GRANTED" in r.stderr:
+            log("paste_helper not yet Accessibility-trusted — using osascript")
+        else:
+            log(f"paste_helper exit {r.returncode}: {r.stderr.strip()[:120]}")
+        return (False, r.stdout.strip())
+    log("paste via CGEvent helper")
+    return (True, r.stdout.strip())
+
+
+def _paste_via_osascript(target: str) -> str:
+    """Fallback paste via osascript → System Events. Single pass: frontmost
+    check, conditional reactivate, Cmd+V. (Reactivation is conditional because
+    an unconditional 'set frontmost to true' on an Electron app kicks off a
+    slow re-focus cycle that can drop the caret.) Returns frontmost-before."""
+    if not target:
+        paste()
+        return ""
     safe = target.replace("\\", "\\\\").replace('"', '\\"')
     _, out, _ = run_applescript(f'''
 tell application "System Events"
@@ -367,7 +418,7 @@ def process_dictation(t0: float):
                 log(f"focus still on {target} — pasted directly  [+{time.monotonic()-t0:.2f}s]")
         else:
             log("no target-app capture found, pasting into current frontmost")
-            paste()
+            focus_target_and_paste("")
         log(f"PASTE DONE — total time [+{time.monotonic()-t0:.2f}s]")
 
         # Non-daemon thread: in one-shot mode it keeps the process alive until
@@ -396,7 +447,8 @@ def main():
     readable; a launchd agent would be TCC-blocked from reading .env / the log.
     """
     log("LAUNCH (hold start) — warming up")
-    prewarm_system_events()
+    prewarm_paste_helper()      # primary paste path
+    prewarm_system_events()     # osascript fallback path
 
     # Block until release. Timeout is generous because it spans the entire
     # hold; a real hold is seconds, and if nothing arrives the user never
