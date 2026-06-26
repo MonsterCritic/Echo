@@ -206,6 +206,27 @@ def write_clipboard(text: str):
     subprocess.run(["pbcopy"], input=text, text=True)
 
 
+def prewarm_system_events():
+    """Fire a throwaway osascript immediately on key release so the shared
+    System Events process is launched/awake by the time we paste.
+
+    On a cold machine the first osascript→System Events call costs ~1.5–2s
+    (the bulk of the post-transcription delay). Kicking it off here lets that
+    cost overlap the transcribe + prettify network round-trips instead of
+    stacking on top of them, so the real paste call lands warm. Non-blocking
+    and best-effort — failures are irrelevant, the real paste re-checks."""
+    try:
+        subprocess.Popen(
+            ["/usr/bin/osascript", "-e",
+             'tell application "System Events" to get name of first process whose frontmost is true'],
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
+    except Exception:
+        pass
+
+
 def paste():
     run_applescript('''
 tell application "System Events"
@@ -214,24 +235,31 @@ end tell
 ''')
 
 
-def activate_process(name: str):
-    """Bring the named process back to the foreground. Used to restore the
-    app that was frontmost when the user started holding the hotkey, so the
-    paste lands where the user started, not wherever focus drifted to."""
-    safe = name.replace("\\", "\\\\").replace('"', '\\"')
-    run_applescript(f'''
+def focus_target_and_paste(target: str) -> str:
+    """Check the frontmost app, bring `target` forward only if focus drifted,
+    then send Cmd+V — all in a SINGLE osascript pass.
+
+    Each osascript spawned from the hotkey context pays a ~1–1.5s cold cost to
+    connect to System Events, so doing the frontmost-check, the conditional
+    reactivation, and the paste as three separate calls was the bulk of the
+    post-transcription delay. One call pays that cost once.
+
+    Reactivation is conditional because an unconditional "set frontmost to
+    true" on an Electron app (Claude Desktop, VS Code) kicks off a slow
+    re-focus cycle that can drop the input caret. Returns the app that was
+    frontmost before we pasted, for logging."""
+    safe = target.replace("\\", "\\\\").replace('"', '\\"')
+    _, out, _ = run_applescript(f'''
 tell application "System Events"
-    set frontmost of first process whose name is "{safe}" to true
+    set fp to name of first process whose frontmost is true
+    if fp is not "{safe}" then
+        set frontmost of (first process whose name is "{safe}") to true
+        delay 0.3
+    end if
+    keystroke "v" using command down
+    return fp
 end tell
-delay 0.4
 ''')
-
-
-def get_frontmost_process_name() -> str:
-    """Diagnostic: log which app is frontmost right before paste fires."""
-    _, out, _ = run_applescript(
-        'tell application "System Events" to return name of first process whose frontmost is true'
-    )
     return out.strip()
 
 
@@ -257,7 +285,23 @@ display dialog "{safe}" with title "AI Dictate — Error" buttons {{"OK"}} defau
 # ── Main ──────────────────────────────────────────────────────────────────────
 
 def main():
+    t0 = time.monotonic()
     log("STOP fired")
+
+    # Wake System Events now so its ~1.5–2s cold-start overlaps the API
+    # round-trips below instead of landing on the paste at the end.
+    prewarm_system_events()
+
+    # How long ago did the recording actually stop? The m4a is finalized by
+    # the daemon the moment the key is released, so its age here ≈ the lag
+    # between "user let go" and "this script started running" (Karabiner
+    # dispatch + python launch). Lets us see latency the rest of the log
+    # can't, since every other timestamp is relative to this script.
+    try:
+        rec_age = time.time() - os.path.getmtime(AUDIO_PATH)
+        log(f"recording finalized {rec_age:.2f}s before script start")
+    except Exception:
+        pass
 
     # Karabiner only invokes us when the start flag existed (i.e. a real
     # dictation session was in progress), so we can assume the daemon is
@@ -291,17 +335,17 @@ def main():
         return
 
     try:
-        log("Transcribing…")
+        log(f"Transcribing…  [+{time.monotonic()-t0:.2f}s]")
         raw = transcribe(AUDIO_PATH, openai_key)
-        log(f"Transcript: {repr(raw)}")
+        log(f"Transcript: {repr(raw)}  [+{time.monotonic()-t0:.2f}s]")
 
         if not raw.strip():
             log("Empty transcript")
             return
 
-        log("Prettifying…")
+        log(f"Prettifying…  [+{time.monotonic()-t0:.2f}s]")
         clean = prettify(raw, openai_key)
-        log(f"Final: {repr(clean)}")
+        log(f"Final: {repr(clean)}  [+{time.monotonic()-t0:.2f}s]")
 
         # Write to history BEFORE paste so the text is always recoverable,
         # even if paste lands in the wrong window or doesn't fire at all.
@@ -313,24 +357,20 @@ def main():
         saved = read_clipboard()
         write_clipboard(clean)
 
-        # Reactivate the app that was frontmost when the user started
-        # holding fn, so the paste lands in the right window even if focus
-        # drifted during the hold.
+        # Bring the original app forward (only if focus drifted) and paste —
+        # in one osascript pass to avoid paying the System Events cold-start
+        # cost multiple times. See focus_target_and_paste for the why.
         target = read_target_app()
         if target:
-            log(f"reactivating: {target}")
-            activate_process(target)
+            front_before = focus_target_and_paste(target)
+            if front_before != target:
+                log(f"focus had drifted: {front_before} → reactivated {target}, pasted  [+{time.monotonic()-t0:.2f}s]")
+            else:
+                log(f"focus still on {target} — pasted directly  [+{time.monotonic()-t0:.2f}s]")
         else:
             log("no target-app capture found, pasting into current frontmost")
-
-        # Extra settle time — Electron apps (Claude Desktop, VS Code, etc.)
-        # can take 200–400ms after their main process is brought to front
-        # before the input field's caret is actually re-focused. Sending
-        # Cmd+V too early goes nowhere.
-        time.sleep(0.3)
-        front_now = get_frontmost_process_name()
-        log(f"frontmost just before paste: {front_now}")
-        paste()
+            paste()
+        log(f"PASTE DONE — total script time [+{time.monotonic()-t0:.2f}s]")
 
         # Keep the dictated text on the clipboard for several seconds so the
         # user can manually Cmd+V if the auto-paste missed the input. The
