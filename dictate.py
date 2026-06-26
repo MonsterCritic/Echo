@@ -29,6 +29,12 @@ START_FLAG  = "/tmp/rewrite_record_start"
 TARGET_APP  = "/tmp/rewrite_record_app.txt"
 PASTE_HELPER = os.path.join(SCRIPT_DIR, "paste_helper")
 
+# Active path: ONE call to /v1/audio/translations (whisper-1) that transcribes
+# AND translates to English in a single round-trip — halves API latency vs the
+# transcribe→prettify two-step. The two-step (gpt-4o-mini-transcribe + the
+# prettify model below) is kept available for revert; see translate_audio vs
+# transcribe/prettify.
+OPENAI_TRANSLATE_MODEL  = "whisper-1"
 OPENAI_TRANSCRIBE_MODEL = "gpt-4o-mini-transcribe"
 OPENAI_PRETTIFY_MODEL   = "gpt-4.1-mini"
 
@@ -141,8 +147,45 @@ def play_sound(name: str):
 
 # ── API calls ─────────────────────────────────────────────────────────────────
 
+def translate_audio(audio_path: str, api_key: str) -> str:
+    """Transcribe AND translate to English in ONE call via
+    /v1/audio/translations (whisper-1). This is the active path — it halves API
+    latency vs transcribe→prettify by collapsing two round-trips into one.
+
+    Trade-offs (accepted for speed): output is always English, and the
+    'don't translate'/'verbatim' voice commands plus aggressive filler cleanup
+    are gone. Whisper still punctuates/capitalizes and drops most filler on its
+    own, so short dictations come out clean."""
+    with open(audio_path, "rb") as f:
+        audio_data = f.read()
+
+    boundary = "----dictateformboundary7MA4YWxkTrZu0gW"
+    body = b""
+    body += f"--{boundary}\r\n".encode()
+    body += b'Content-Disposition: form-data; name="model"\r\n\r\n'
+    body += OPENAI_TRANSLATE_MODEL.encode() + b"\r\n"
+    body += f"--{boundary}\r\n".encode()
+    body += b'Content-Disposition: form-data; name="file"; filename="audio.m4a"\r\n'
+    body += b"Content-Type: audio/mp4\r\n\r\n"
+    body += audio_data + b"\r\n"
+    body += f"--{boundary}--\r\n".encode()
+
+    req = urllib.request.Request(
+        "https://api.openai.com/v1/audio/translations",
+        data=body,
+        headers={
+            "Authorization": f"Bearer {api_key}",
+            "Content-Type":  f"multipart/form-data; boundary={boundary}",
+        },
+    )
+    with urllib.request.urlopen(req, timeout=60) as resp:
+        data = json.load(resp)
+        return data.get("text", "")
+
+
 def transcribe(audio_path: str, api_key: str) -> str:
-    """Upload audio file to OpenAI /v1/audio/transcriptions."""
+    """Upload audio file to OpenAI /v1/audio/transcriptions. (Legacy two-step
+    path; kept for revert — see translate_audio for the active single call.)"""
     with open(audio_path, "rb") as f:
         audio_data = f.read()
 
@@ -384,17 +427,15 @@ def process_dictation(t0: float):
         return
 
     try:
-        log(f"Transcribing…  [+{time.monotonic()-t0:.2f}s]")
-        raw = transcribe(AUDIO_PATH, openai_key)
-        log(f"Transcript: {repr(raw)}  [+{time.monotonic()-t0:.2f}s]")
+        log(f"Transcribing+translating…  [+{time.monotonic()-t0:.2f}s]")
+        clean = translate_audio(AUDIO_PATH, openai_key)
+        log(f"Final: {repr(clean)}  [+{time.monotonic()-t0:.2f}s]")
 
-        if not raw.strip():
+        if not clean.strip():
             log("Empty transcript")
             return
 
-        log(f"Prettifying…  [+{time.monotonic()-t0:.2f}s]")
-        clean = prettify(raw, openai_key)
-        log(f"Final: {repr(clean)}  [+{time.monotonic()-t0:.2f}s]")
+        raw = clean   # single-call path: the translation IS the final text
 
         # Write to history BEFORE paste so the text is always recoverable,
         # even if paste lands in the wrong window or doesn't fire at all.
