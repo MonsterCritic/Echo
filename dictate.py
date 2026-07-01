@@ -85,19 +85,30 @@ def log(msg: str):
         f.write(f"[{datetime.now().isoformat()}] [DICT] {msg}\n")
 
 
-def append_history(raw: str, final: str):
-    """Write the dictation to a markdown history file. Done BEFORE paste so
-    that even if paste fails or lands in the wrong window, the text is
-    recoverable from this file."""
+def prepend_history(raw: str, final: str):
+    """Write the dictation to the TOP of the markdown history file (newest
+    first). Done BEFORE paste so that even if the paste fails or lands in the
+    wrong window, the text is recoverable from this file.
+
+    Prepend means rewriting the file each time, but it stays small and
+    dictations are infrequent, so the cost is negligible."""
     ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-    block = (
-        f"## {ts}\n\n"
-        f"**Raw transcript:**  \n{raw.strip()}\n\n"
-        f"**Final:**  \n{final.strip()}\n\n"
-        f"---\n\n"
-    )
-    with open(HISTORY_PATH, "a") as f:
-        f.write(block)
+    # On the single-call path raw == final, so show the text once; on the
+    # legacy two-step path they differ, so show both.
+    if raw.strip() == final.strip():
+        body = f"{final.strip()}\n\n"
+    else:
+        body = (f"**Raw transcript:**  \n{raw.strip()}\n\n"
+                f"**Final:**  \n{final.strip()}\n\n")
+    block = f"## {ts}\n\n{body}---\n\n"
+
+    try:
+        with open(HISTORY_PATH) as f:
+            existing = f.read()
+    except FileNotFoundError:
+        existing = ""
+    with open(HISTORY_PATH, "w") as f:
+        f.write(block + existing)
 
 
 # ── Config loading ────────────────────────────────────────────────────────────
@@ -440,7 +451,7 @@ def process_dictation(t0: float):
         # Write to history BEFORE paste so the text is always recoverable,
         # even if paste lands in the wrong window or doesn't fire at all.
         try:
-            append_history(raw, clean)
+            prepend_history(raw, clean)
         except Exception as e:
             log(f"history write failed: {e}")
 
