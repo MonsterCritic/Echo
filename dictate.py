@@ -439,14 +439,23 @@ def process_dictation(t0: float):
 
     try:
         log(f"Transcribing+translating…  [+{time.monotonic()-t0:.2f}s]")
-        clean = translate_audio(AUDIO_PATH, openai_key)
+        try:
+            # Fast path: one call that transcribes + translates to English.
+            clean = translate_audio(AUDIO_PATH, openai_key)
+            raw = clean   # single call: the translation IS the final text
+        except Exception as e:
+            # The translations endpoint occasionally returns a transient 404
+            # "Invalid URL". Rather than fail the dictation, fall back to the
+            # two-step (transcribe + prettify) — different endpoints, so a
+            # translations blip doesn't take dictation down with it.
+            log(f"translate_audio failed ({e}) — falling back to transcribe+prettify")
+            raw = transcribe(AUDIO_PATH, openai_key)
+            clean = prettify(raw, openai_key) if raw.strip() else ""
         log(f"Final: {repr(clean)}  [+{time.monotonic()-t0:.2f}s]")
 
         if not clean.strip():
             log("Empty transcript")
             return
-
-        raw = clean   # single-call path: the translation IS the final text
 
         # Write to history BEFORE paste so the text is always recoverable,
         # even if paste lands in the wrong window or doesn't fire at all.
