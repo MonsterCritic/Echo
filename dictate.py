@@ -100,7 +100,7 @@ def prepend_history(raw: str, final: str):
     else:
         body = (f"**Raw transcript:**  \n{raw.strip()}\n\n"
                 f"**Final:**  \n{final.strip()}\n\n")
-    block = f"## {ts}\n\n{body}---\n\n"
+    block = f"## {ts} · Dictate\n\n{body}---\n\n"
 
     try:
         with open(HISTORY_PATH) as f:

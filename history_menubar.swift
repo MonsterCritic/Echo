@@ -68,20 +68,38 @@ class StatusController: NSObject, NSMenuDelegate {
         menu.addItem(quitItem)
     }
 
-    /// Read the history file and return the text of the most recent
-    /// `**Final:**` block, or nil if the file is empty/missing.
+    /// Read the history file and return the output text of the MOST RECENT
+    /// entry, or nil if empty/missing. History is prepended (newest first), so
+    /// the newest entry is the first `## ` block. Handles all entry shapes:
+    ///   • Dictate single-call — plain text under the header
+    ///   • Dictate two-step    — text under `**Final:**`
+    ///   • Rewrite             — text under `**Rewritten:**`
     func lastFinal() -> String? {
         guard let content = try? String(contentsOfFile: historyPath,
                                         encoding: .utf8) else { return nil }
-        guard let markerRange = content.range(of: "**Final:**",
-                                              options: .backwards) else { return nil }
-        let afterMarker = content[markerRange.upperBound...]
-        // Trim leading whitespace/newline after the marker.
-        let trimmedStart = afterMarker.drop(while: { $0.isWhitespace })
-        // The block ends at the next "---" separator or end of file.
-        let endRange = trimmedStart.range(of: "\n---")
-        let body = endRange.map { String(trimmedStart[..<$0.lowerBound]) }
-                   ?? String(trimmedStart)
+        // Newest entry = first "## " header (prepended history).
+        guard let headerRange = content.range(of: "## ") else { return nil }
+        let afterHeader = content[headerRange.lowerBound...]
+        // Block ends at the next "---" separator or end of file.
+        let blockEnd = afterHeader.range(of: "\n---")
+        let block = blockEnd.map { String(afterHeader[..<$0.lowerBound]) }
+                    ?? String(afterHeader)
+
+        func textAfter(_ marker: String) -> String? {
+            guard let r = block.range(of: marker) else { return nil }
+            return String(block[r.upperBound...])
+        }
+
+        let body: String
+        if let t = textAfter("**Rewritten:**") {        // rewrite → corrected text
+            body = t
+        } else if let t = textAfter("**Final:**") {      // dictate two-step → final
+            body = t
+        } else if let nl = block.firstIndex(of: "\n") {  // plain entry → drop header line
+            body = String(block[block.index(after: nl)...])
+        } else {
+            body = block
+        }
         let text = body.trimmingCharacters(in: .whitespacesAndNewlines)
         return text.isEmpty ? nil : text
     }

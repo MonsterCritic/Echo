@@ -13,10 +13,11 @@ import urllib.request
 import urllib.error
 from datetime import datetime
 
-SCRIPT_DIR  = os.path.dirname(os.path.abspath(__file__))
-CONFIG_PATH = os.path.join(SCRIPT_DIR, ".env")
-LOG_PATH    = os.path.join(SCRIPT_DIR, "rewrite.log")
-MODEL       = "gpt-4.1-mini"
+SCRIPT_DIR   = os.path.dirname(os.path.abspath(__file__))
+CONFIG_PATH  = os.path.join(SCRIPT_DIR, ".env")
+LOG_PATH     = os.path.join(SCRIPT_DIR, "rewrite.log")
+HISTORY_PATH = os.path.join(SCRIPT_DIR, "dictate_history.md")
+MODEL        = "gpt-4.1-mini"
 
 SYSTEM_PROMPT = (
     "You are a text-rewriting engine. You do not converse, answer questions, "
@@ -53,6 +54,26 @@ SYSTEM_PROMPT = (
 def log(msg: str):
     with open(LOG_PATH, "a") as f:
         f.write(f"[{datetime.now().isoformat()}] {msg}\n")
+
+
+def prepend_history(original: str, rewritten: str):
+    """Record the correction at the TOP of the shared history file (newest
+    first), tagged '· Rewrite' so it's distinguishable from dictations. Written
+    before the paste so the text is recoverable even if the paste misses."""
+    ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    block = (
+        f"## {ts} · Rewrite\n\n"
+        f"**Original:**  \n{original.strip()}\n\n"
+        f"**Rewritten:**  \n{rewritten.strip()}\n\n"
+        f"---\n\n"
+    )
+    try:
+        with open(HISTORY_PATH) as f:
+            existing = f.read()
+    except FileNotFoundError:
+        existing = ""
+    with open(HISTORY_PATH, "w") as f:
+        f.write(block + existing)
 
 
 def run_applescript(script: str) -> tuple[int, str, str]:
@@ -169,6 +190,13 @@ def main():
         result = call_openai(api_key, selected)
         log(f"Success — got {len(result)} chars back")
         log(f"OUTPUT: {repr(result)}")
+
+        # Record to the shared history BEFORE pasting so the corrected text is
+        # recoverable even if the paste misses (mirrors AI Dictate).
+        try:
+            prepend_history(selected, result)
+        except Exception as e:
+            log(f"history write failed: {e}")
 
         # The Quick Action's serviceOutputMechanism is not "replace
         # selected text", so stdout is discarded — Cmd+V is the only
