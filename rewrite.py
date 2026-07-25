@@ -17,6 +17,7 @@ SCRIPT_DIR   = os.path.dirname(os.path.abspath(__file__))
 CONFIG_PATH  = os.path.join(SCRIPT_DIR, ".env")
 LOG_PATH     = os.path.join(SCRIPT_DIR, "rewrite.log")
 HISTORY_PATH = os.path.join(SCRIPT_DIR, "dictate_history.md")
+PASTE_HELPER = os.path.join(SCRIPT_DIR, "paste_helper")
 MODEL        = "gpt-4.1-mini"
 
 SYSTEM_PROMPT = (
@@ -135,10 +136,20 @@ def call_openai(api_key: str, text: str) -> str:
 
 
 def get_frontmost_process() -> str:
-    _, out, _ = run_applescript(
-        'tell application "System Events" to return name of first process whose frontmost is true'
-    )
-    return out
+    """Frontmost app name via lsappinfo (~10ms). Unlike osascript → System
+    Events, this has no multi-second cold-start under system load."""
+    try:
+        asn = subprocess.run(["/usr/bin/lsappinfo", "front"],
+                             capture_output=True, text=True, timeout=3).stdout.strip()
+        if not asn:
+            return ""
+        out = subprocess.run(["/usr/bin/lsappinfo", "info", "-only", "name", asn],
+                            capture_output=True, text=True, timeout=3).stdout
+        # out looks like: "LSDisplayName"="Claude"
+        parts = out.strip().split("=")
+        return parts[-1].strip().strip('"') if len(parts) >= 2 else ""
+    except Exception:
+        return ""
 
 
 def read_clipboard() -> str:
@@ -149,21 +160,50 @@ def write_clipboard(text: str):
     subprocess.run(["pbcopy"], input=text, text=True)
 
 
-def activate_process(name: str):
-    run_applescript(f'''
+def focus_target_and_paste(target: str) -> str:
+    """Bring `target` forward if focus drifted, then Cmd+V. Prefers the CGEvent
+    helper (paste_helper) — no System Events dependency, so it stays fast under
+    load — and falls back to osascript if the helper is missing or not yet
+    Accessibility-trusted. Returns the app that was frontmost before pasting."""
+    ok, front = _paste_via_helper(target)
+    if ok:
+        return front
+    return _paste_via_osascript(target)
+
+
+def _paste_via_helper(target: str) -> tuple[bool, str]:
+    if not os.path.exists(PASTE_HELPER):
+        return (False, "")
+    try:
+        r = subprocess.run([PASTE_HELPER, target or ""],
+                           capture_output=True, text=True, timeout=10)
+    except Exception as e:
+        log(f"paste_helper error: {e}")
+        return (False, "")
+    if r.returncode != 0:
+        log(f"paste_helper exit {r.returncode} — using osascript")
+        return (False, r.stdout.strip())
+    return (True, r.stdout.strip())
+
+
+def _paste_via_osascript(target: str) -> str:
+    """Fallback: conditional reactivate (only if focus drifted, to avoid the
+    slow Electron re-focus) + Cmd+V, via System Events."""
+    if target:
+        current = get_frontmost_process()
+        if current and current != target:
+            run_applescript(f'''
 tell application "System Events"
-    set frontmost of first process whose name is "{name}" to true
+    set frontmost of first process whose name is "{target}" to true
 end tell
 delay 0.25
 ''')
-
-
-def paste():
     run_applescript('''
 tell application "System Events"
     keystroke "v" using command down
 end tell
 ''')
+    return target
 
 
 def main():
@@ -207,21 +247,13 @@ def main():
 
         write_clipboard(result)
 
-        # Re-activate the original app ONLY if focus has drifted. In
-        # Electron apps (Claude desktop, etc.) even a no-op "set
-        # frontmost to true" triggers a re-focus cycle that drops the
-        # input field's selection. With selection gone, Cmd+V appends
-        # instead of replacing, leaving the user with the original text
-        # AND the rewritten text side-by-side.
-        if original_process:
-            current_front = get_frontmost_process()
-            if current_front != original_process:
-                log(f"focus drifted: {current_front} → reactivating {original_process}")
-                activate_process(original_process)
-
+        # Paste via the CGEvent helper (falls back to osascript). It reactivates
+        # the original app only if focus drifted — an unconditional re-focus on
+        # an Electron app (Claude desktop) drops the input selection, which
+        # would make Cmd+V append instead of replace.
         log("Pasting...")
-        paste()
-        log("Paste sent")
+        front = focus_target_and_paste(original_process)
+        log(f"Paste sent (was on {front})")
 
         time.sleep(0.5)
         write_clipboard(saved_clipboard)
