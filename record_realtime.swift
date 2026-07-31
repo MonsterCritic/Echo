@@ -40,8 +40,27 @@ func log(_ s: String) {
     }
 }
 
-guard let apiKey = ProcessInfo.processInfo.environment["OPENAI_API_KEY"], !apiKey.isEmpty else {
-    log("FATAL: OPENAI_API_KEY not set in environment (set it in the LaunchAgent plist)")
+// Key lookup: environment first (direct exec), then a key file. We can't read
+// ~/Documents/.env — TCC blocks that for a launchd/LaunchServices process — but
+// ~/Library/Application Support is readable, so the installer mirrors the key
+// there (chmod 600). A file also survives `open -Wg`, which drops the
+// environment but is required for the app to get a Microphone grant.
+let keyFile = NSString(string: "~/Library/Application Support/Echo/openai_key")
+              .expandingTildeInPath
+
+func resolveAPIKey() -> String? {
+    if let env = ProcessInfo.processInfo.environment["OPENAI_API_KEY"], !env.isEmpty {
+        return env
+    }
+    if let s = try? String(contentsOfFile: keyFile, encoding: .utf8) {
+        let k = s.trimmingCharacters(in: .whitespacesAndNewlines)
+        if !k.isEmpty { return k }
+    }
+    return nil
+}
+
+guard let apiKey = resolveAPIKey() else {
+    log("FATAL: no API key — set OPENAI_API_KEY or create \(keyFile)")
     exit(1)
 }
 

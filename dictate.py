@@ -29,6 +29,22 @@ START_FLAG  = "/tmp/rewrite_record_start"
 TARGET_APP  = "/tmp/rewrite_record_app.txt"
 PASTE_HELPER = os.path.join(SCRIPT_DIR, "paste_helper")
 
+# ── Which recorder are we paired with? ────────────────────────────────────────
+# True  → record_realtime.app streamed the audio to OpenAI's realtime API during
+#         the hold and left the (source-language) transcript in TRANSCRIPT_PATH.
+#         We only translate + paste, so nothing is uploaded after release.
+# False → record.app wrote an m4a; we upload it after release (whisper-1).
+#
+# TO REVERT to the file path, flip this to False and swap the LaunchAgents.
+# NOTE the installed m4a recorder is labelled com.sergeyshmidt.* (the live
+# install predates setup.sh's com.echo.* naming — check `launchctl list`):
+#   launchctl unload ~/Library/LaunchAgents/com.echo.context-helper.record-realtime.plist
+#   launchctl load   ~/Library/LaunchAgents/com.sergeyshmidt.context-helper.record.plist
+# Only ONE recorder daemon may run at a time — both poll START_FLAG and would
+# otherwise fight over the microphone.
+REALTIME_MODE   = True
+TRANSCRIPT_PATH = "/tmp/rewrite_transcript.txt"
+
 # Active path: ONE call to /v1/audio/translations (whisper-1) that transcribes
 # AND translates to English in a single round-trip — halves API latency vs the
 # transcribe→prettify two-step. The two-step (gpt-4o-mini-transcribe + the
@@ -411,26 +427,77 @@ def _delayed_restore(saved: str, clean: str):
         pass
 
 
+def _finish_dictation(raw: str, clean: str, t0: float):
+    """Shared tail for both recorder paths: record history, then paste `clean`
+    into the app that was frontmost when the hold started."""
+    # Write to history BEFORE paste so the text is always recoverable, even if
+    # the paste lands in the wrong window or doesn't fire at all.
+    try:
+        prepend_history(raw, clean)
+    except Exception as e:
+        log(f"history write failed: {e}")
+
+    saved = read_clipboard()
+    write_clipboard(clean)
+
+    # Bring the original app forward (only if focus drifted) and paste — in one
+    # pass, to avoid paying the System Events cold-start cost more than once.
+    target = read_target_app()
+    if target:
+        front_before = focus_target_and_paste(target)
+        if front_before != target:
+            log(f"focus had drifted: {front_before} → reactivated {target}, pasted  [+{time.monotonic()-t0:.2f}s]")
+        else:
+            log(f"focus still on {target} — pasted directly  [+{time.monotonic()-t0:.2f}s]")
+    else:
+        log("no target-app capture found, pasting into current frontmost")
+        focus_target_and_paste("")
+    log(f"PASTE DONE — total time [+{time.monotonic()-t0:.2f}s]")
+
+    # Non-daemon thread so it keeps the process alive until the restore fires.
+    threading.Thread(target=_delayed_restore, args=(saved, clean)).start()
+
+
+def read_realtime_transcript() -> str:
+    """Read the transcript the realtime recorder streamed during the hold."""
+    try:
+        with open(TRANSCRIPT_PATH) as f:
+            return f.read().strip()
+    except Exception as e:
+        log(f"transcript read failed: {e}")
+        return ""
+
+
 def process_dictation(t0: float):
-    """Run the full pipeline assuming the m4a is finalized and the ready flag
-    has already been consumed by the caller. t0 is the monotonic clock at the
-    moment the recording stopped, for latency logging."""
+    """Run the pipeline once the recorder has signalled ready (flag already
+    consumed by the caller). t0 is the monotonic clock at the moment the
+    recording stopped, for latency logging.
+
+    In REALTIME_MODE the transcript already exists (streamed during the hold),
+    so only the translate + paste remain. Otherwise the m4a is uploaded here."""
     # Wake System Events so its cold-start overlaps the API calls below rather
     # than landing on the paste. (The hold-time osascript usually warms it
     # already, but this covers the case where it went cold.)
     prewarm_system_events()
     play_sound("Morse")
 
-    if not os.path.exists(AUDIO_PATH):
-        log("Audio file missing")
-        show_error("Audio file missing — check microphone permission for the recorder.")
-        return
-
-    size = os.path.getsize(AUDIO_PATH)
-    log(f"Audio size: {size} bytes")
-    if size < 2000:
-        log("Audio too short — ignoring")
-        return
+    spoken = ""
+    if REALTIME_MODE:
+        spoken = read_realtime_transcript()
+        log(f"realtime transcript: {len(spoken)} chars  [+{time.monotonic()-t0:.2f}s]")
+        if not spoken:
+            log("Empty realtime transcript — nothing to paste")
+            return
+    else:
+        if not os.path.exists(AUDIO_PATH):
+            log("Audio file missing")
+            show_error("Audio file missing — check microphone permission for the recorder.")
+            return
+        size = os.path.getsize(AUDIO_PATH)
+        log(f"Audio size: {size} bytes")
+        if size < 2000:
+            log("Audio too short — ignoring")
+            return
 
     openai_key = load_env("OPENAI_API_KEY")
     if not openai_key:
@@ -438,6 +505,19 @@ def process_dictation(t0: float):
         return
 
     try:
+        if REALTIME_MODE:
+            # Transcription already happened during the hold; just translate
+            # + tidy the text (prettify handles non-English → English).
+            raw = spoken
+            log(f"Translating…  [+{time.monotonic()-t0:.2f}s]")
+            clean = prettify(raw, openai_key)
+            log(f"Final: {repr(clean)}  [+{time.monotonic()-t0:.2f}s]")
+            if not clean.strip():
+                log("Empty result")
+                return
+            _finish_dictation(raw, clean, t0)
+            return
+
         log(f"Transcribing+translating…  [+{time.monotonic()-t0:.2f}s]")
         try:
             # Fast path: one call that transcribes + translates to English.
@@ -457,34 +537,7 @@ def process_dictation(t0: float):
             log("Empty transcript")
             return
 
-        # Write to history BEFORE paste so the text is always recoverable,
-        # even if paste lands in the wrong window or doesn't fire at all.
-        try:
-            prepend_history(raw, clean)
-        except Exception as e:
-            log(f"history write failed: {e}")
-
-        saved = read_clipboard()
-        write_clipboard(clean)
-
-        # Bring the original app forward (only if focus drifted) and paste —
-        # in one osascript pass to avoid paying the System Events cold-start
-        # cost multiple times. See focus_target_and_paste for the why.
-        target = read_target_app()
-        if target:
-            front_before = focus_target_and_paste(target)
-            if front_before != target:
-                log(f"focus had drifted: {front_before} → reactivated {target}, pasted  [+{time.monotonic()-t0:.2f}s]")
-            else:
-                log(f"focus still on {target} — pasted directly  [+{time.monotonic()-t0:.2f}s]")
-        else:
-            log("no target-app capture found, pasting into current frontmost")
-            focus_target_and_paste("")
-        log(f"PASTE DONE — total time [+{time.monotonic()-t0:.2f}s]")
-
-        # Non-daemon thread: in one-shot mode it keeps the process alive until
-        # the restore fires; in watch mode the loop carries on immediately.
-        threading.Thread(target=_delayed_restore, args=(saved, clean)).start()
+        _finish_dictation(raw, clean, t0)
 
     except urllib.error.HTTPError as e:
         body = e.read().decode()[:300]
