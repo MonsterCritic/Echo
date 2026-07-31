@@ -34,7 +34,14 @@ PID_PATH    = "/tmp/rewrite_speak.pid"
 CHUNK_DIR   = "/tmp/rewrite_speak_chunks"
 
 TRANSLATE_MODEL = "gpt-4.1-nano"
-TTS_MODEL       = "tts-1"      # gpt-4o-mini-tts is nicer but slower
+TTS_MODEL       = "tts-1"      # lowest-latency TTS; gpt-4o-mini-tts is nicer but slower
+# wav/pcm are the formats OpenAI recommends for fastest response — the audio
+# needs no decoding before playback, unlike mp3. afplay handles wav natively.
+AUDIO_FORMAT    = "wav"
+AUDIO_EXT       = "wav"
+# Sentences after the first are grouped up to this size: once audio is playing
+# there's no latency pressure, and bigger chunks give the translator more context.
+CHUNK_TARGET_CHARS = 400
 TTS_VOICE       = "nova"       # alloy / echo / fable / onyx / nova / shimmer
 
 TRANSLATE_PROMPT = (
@@ -166,7 +173,7 @@ def synthesize_to_file(text: str, api_key: str, output_path: str):
         "model":           TTS_MODEL,
         "voice":           TTS_VOICE,
         "input":           text,
-        "response_format": "mp3",
+        "response_format": AUDIO_FORMAT,
     }
     req = urllib.request.Request(
         "https://api.openai.com/v1/audio/speech",
@@ -176,12 +183,40 @@ def synthesize_to_file(text: str, api_key: str, output_path: str):
             "Content-Type":  "application/json",
         },
     )
+    # The response is chunked, so copy it through as it arrives instead of
+    # buffering the whole body in memory before writing.
     with urllib.request.urlopen(req, timeout=60) as resp:
         with open(output_path, "wb") as f:
-            f.write(resp.read())
+            while True:
+                buf = resp.read(16384)
+                if not buf:
+                    break
+                f.write(buf)
 
 
 # ── Sentence chunking ────────────────────────────────────────────────────────
+
+def group_sentences(sentences: list[str]) -> list[str]:
+    """Batch sentences into chunks for the translate→TTS pipeline.
+
+    The first chunk is deliberately a single sentence so playback starts as soon
+    as possible; later chunks are grouped up to CHUNK_TARGET_CHARS because there
+    is no latency pressure once audio is already playing, and larger chunks give
+    the translator more context and cost fewer round-trips."""
+    if not sentences:
+        return []
+    chunks = [sentences[0]]
+    buf = ""
+    for s in sentences[1:]:
+        if buf and len(buf) + len(s) + 1 > CHUNK_TARGET_CHARS:
+            chunks.append(buf)
+            buf = s
+        else:
+            buf = f"{buf} {s}".strip()
+    if buf:
+        chunks.append(buf)
+    return chunks
+
 
 def split_sentences(text: str) -> list[str]:
     """Naive sentence splitter — works fine for prose. Keeps the trailing
@@ -230,35 +265,41 @@ def main():
         return
 
     try:
-        # 1. Translate (skipped if selection is already Russian).
-        if is_already_russian(selection):
+        started = time.time()
+        already_russian = is_already_russian(selection)
+        if already_russian:
             log("already Russian — skipping translate")
-            russian = selection
-        else:
-            t0 = time.time()
-            russian = translate_to_russian(selection, api_key)
-            log(f"translated in {time.time()-t0:.2f}s")
 
-        # 2. Split into sentences for pipelined TTS.
-        sentences = split_sentences(russian)
-        log(f"{len(sentences)} sentence(s)")
+        # 1. Split the SOURCE text, so translation happens per chunk inside the
+        #    pipeline rather than once over everything up front. Translating the
+        #    whole selection first was pure dead time before any audio (~2.8s on
+        #    a 483-char selection); now only the first chunk has to be translated
+        #    before playback can start.
+        chunks = group_sentences(split_sentences(selection))
+        log(f"{len(chunks)} chunk(s) from {len(split_sentences(selection))} sentence(s)")
 
         os.makedirs(CHUNK_DIR, exist_ok=True)
 
-        # 3. Producer thread: synthesizes each sentence into its own MP3,
-        #    feeds paths into the queue. Sentinel `None` marks completion.
+        # 2. Producer thread: translate (if needed) then synthesize each chunk,
+        #    feeding paths into the queue. Sentinel `None` marks completion.
         chunk_q: queue.Queue[str | None] = queue.Queue(maxsize=4)
         stop = threading.Event()
 
         def producer():
-            for i, sent in enumerate(sentences):
+            for i, source in enumerate(chunks):
                 if stop.is_set():
                     break
-                chunk_path = os.path.join(CHUNK_DIR, f"chunk_{i}.mp3")
+                chunk_path = os.path.join(CHUNK_DIR, f"chunk_{i}.{AUDIO_EXT}")
                 try:
+                    if already_russian:
+                        text = source
+                    else:
+                        t0 = time.time()
+                        text = translate_to_russian(source, api_key)
+                        log(f"chunk {i} translate {time.time()-t0:.2f}s")
                     t0 = time.time()
-                    synthesize_to_file(sent, api_key, chunk_path)
-                    log(f"chunk {i} synth {time.time()-t0:.2f}s ({len(sent)} chars)")
+                    synthesize_to_file(text, api_key, chunk_path)
+                    log(f"chunk {i} synth {time.time()-t0:.2f}s ({len(text)} chars)")
                     chunk_q.put(chunk_path)
                 except Exception as e:
                     log(f"chunk {i} failed: {e}")
@@ -266,11 +307,15 @@ def main():
 
         threading.Thread(target=producer, daemon=True).start()
 
-        # 4. Consumer (main thread): plays each chunk in order via afplay.
+        # 3. Consumer (main thread): plays each chunk in order via afplay.
+        first = True
         while True:
             chunk_path = chunk_q.get()
             if chunk_path is None:
                 break
+            if first:
+                log(f"TIME TO FIRST AUDIO: {time.time()-started:.2f}s")
+                first = False
             log(f"playing {os.path.basename(chunk_path)}")
             try:
                 subprocess.run(
