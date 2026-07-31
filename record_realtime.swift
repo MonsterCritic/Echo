@@ -131,13 +131,28 @@ final class RealtimeSession {
             flushPending()
         case "conversation.item.input_audio_transcription.completed":
             if let t = obj["transcript"] as? String {
-                lock.lock(); transcript += t; lastActivity = Date(); lock.unlock()
-                log("segment: \(t)")
+                let seg = t.trimmingCharacters(in: .whitespacesAndNewlines)
+                if !seg.isEmpty {
+                    lock.lock()
+                    // Server VAD emits one segment per utterance; join with a
+                    // space so sentences don't run together ("...инпуте?Интересно.").
+                    transcript += transcript.isEmpty ? seg : " " + seg
+                    lastActivity = Date()
+                    lock.unlock()
+                    log("segment: \(seg)")
+                }
             }
         case "conversation.item.input_audio_transcription.delta":
             lock.lock(); lastActivity = Date(); lock.unlock()
         case "error":
-            log("API error: \(s)")
+            // Server VAD usually commits every utterance on its own, so our
+            // final explicit commit often finds an empty buffer. That's
+            // expected and harmless — don't log it as an error.
+            if s.contains("input_audio_buffer_commit_empty") {
+                log("final commit had nothing left (VAD already committed) — ok")
+            } else {
+                log("API error: \(s)")
+            }
         default:
             break
         }
