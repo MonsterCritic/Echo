@@ -166,39 +166,62 @@ final class LiveHUD {
         DispatchQueue.main.async {
             if self.window == nil { self.build() }
             self.label?.stringValue = "Listening…"
+            self.pendingText = nil
+            self.currentHeight = self.minHeight
             self.reposition(height: self.minHeight)
             self.window?.orderFrontRegardless()   // show WITHOUT taking focus
         }
     }
 
+    /// Latest text awaiting display, and whether a flush is already queued.
+    /// Deltas can arrive faster than the window can redraw, and doing a text
+    /// measurement + synchronous setFrame per delta made the caption stall at
+    /// each line wrap and then catch up in whole blocks. Coalescing to a fixed
+    /// interval keeps it smooth regardless of delta rate.
+    private var pendingText: String?
+    private var flushQueued = false
+    private var currentHeight: CGFloat = 0
+    private let flushInterval = 0.05
+
     func update(_ text: String) {
         DispatchQueue.main.async {
-            guard let label = self.label else { return }
-            let t = text.trimmingCharacters(in: .whitespacesAndNewlines)
-            let shown = t.isEmpty ? "Listening…" : t
-
-            // Grow to fit. Only once we hit maxHeight do we start dropping the
-            // oldest words, so short and medium dictations are fully visible
-            // instead of being clipped to a few lines.
-            var display = shown
-            var h = self.heightFor(display)
-            if h >= self.maxHeight {
-                // Trim from the front until it fits the cap, keeping the newest
-                // text — that's the part the user is still speaking.
-                var chars = Array(display)
-                while chars.count > 80 {
-                    chars.removeFirst(min(40, chars.count - 80))
-                    let candidate = "…" + String(chars)
-                    if self.heightFor(candidate) < self.maxHeight {
-                        display = candidate
-                        break
-                    }
-                    display = candidate
-                }
-                h = self.heightFor(display)
+            self.pendingText = text
+            guard !self.flushQueued else { return }
+            self.flushQueued = true
+            DispatchQueue.main.asyncAfter(deadline: .now() + self.flushInterval) {
+                self.flush()
             }
-            label.stringValue = display
-            self.reposition(height: h)
+        }
+    }
+
+    /// Main thread only.
+    private func flush() {
+        flushQueued = false
+        guard let raw = pendingText, let label = label else { return }
+        pendingText = nil
+
+        let t = raw.trimmingCharacters(in: .whitespacesAndNewlines)
+        var display = t.isEmpty ? "Listening…" : t
+
+        // Grow to fit; only past maxHeight do we drop the oldest words, keeping
+        // the newest text — that's what the user is still saying.
+        var h = heightFor(display)
+        if h >= maxHeight {
+            var chars = Array(display)
+            while chars.count > 80 {
+                chars.removeFirst(min(40, chars.count - 80))
+                display = "…" + String(chars)
+                if heightFor(display) < maxHeight { break }
+            }
+            h = heightFor(display)
+        }
+
+        label.stringValue = display
+        // Resizing forces a synchronous redraw, so only do it when the height
+        // genuinely changed (i.e. a line was added or removed).
+        if abs(h - currentHeight) > 0.5 {
+            currentHeight = h
+            reposition(height: h)
         }
     }
 
