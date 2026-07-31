@@ -83,11 +83,16 @@ final class LiveHUD {
 
     private var window: NSWindow?
     private var label: NSTextField?
-    private let width: CGFloat = 620
-    private let height: CGFloat = 92
+    private var bgView: NSVisualEffectView?
+    private let width: CGFloat = 760
+    private let minHeight: CGFloat = 56
+    private let maxHeight: CGFloat = 420
+    private let padX: CGFloat = 18
+    private let padY: CGFloat = 14
+    private let bottomInset: CGFloat = 90
 
     private func build() {
-        let w = NSWindow(contentRect: NSRect(x: 0, y: 0, width: width, height: height),
+        let w = NSWindow(contentRect: NSRect(x: 0, y: 0, width: width, height: minHeight),
                          styleMask: [.borderless, .nonactivatingPanel],
                          backing: .buffered, defer: false)
         w.isOpaque = false
@@ -98,15 +103,18 @@ final class LiveHUD {
         // Follow the user across Spaces / over fullscreen apps.
         w.collectionBehavior = [.canJoinAllSpaces, .fullScreenAuxiliary, .stationary]
 
-        let bg = NSVisualEffectView(frame: NSRect(x: 0, y: 0, width: width, height: height))
+        let bg = NSVisualEffectView(frame: NSRect(x: 0, y: 0, width: width, height: minHeight))
         bg.material = .hudWindow
         bg.blendingMode = .behindWindow
         bg.state = .active
         bg.wantsLayer = true
         bg.layer?.cornerRadius = 14
         bg.layer?.masksToBounds = true
+        bg.autoresizingMask = [.width, .height]
 
-        let tf = NSTextField(frame: NSRect(x: 18, y: 14, width: width - 36, height: height - 28))
+        let tf = NSTextField(frame: NSRect(x: padX, y: padY,
+                                          width: width - padX * 2,
+                                          height: minHeight - padY * 2))
         tf.isEditable = false
         tf.isSelectable = false
         tf.isBordered = false
@@ -117,34 +125,48 @@ final class LiveHUD {
         tf.usesSingleLineMode = false
         tf.cell?.wraps = true
         tf.cell?.isScrollable = false
-        tf.maximumNumberOfLines = 3
+        tf.maximumNumberOfLines = 0        // grow instead of truncating
         tf.stringValue = "Listening…"
         tf.alignment = .left
+        tf.autoresizingMask = [.width, .height]
 
         bg.addSubview(tf)
         w.contentView = bg
         window = w
         label = tf
+        bgView = bg
+    }
+
+    /// Height needed to render `text` at our fixed width.
+    private func heightFor(_ text: String) -> CGFloat {
+        guard let font = label?.font else { return minHeight }
+        let box = NSSize(width: width - padX * 2, height: .greatestFiniteMagnitude)
+        let rect = (text as NSString).boundingRect(
+            with: box,
+            options: [.usesLineFragmentOrigin, .usesFontLeading],
+            attributes: [.font: font])
+        return min(max(ceil(rect.height) + padY * 2, minHeight), maxHeight)
     }
 
     /// Place at the bottom-centre of whichever screen holds the pointer — like
-    /// live captions. Avoids covering the input the user is looking at.
-    private func reposition() {
+    /// live captions. Avoids covering the input the user is looking at. The panel
+    /// grows upward as text accumulates, so the bottom edge stays put.
+    private func reposition(height: CGFloat) {
         guard let w = window else { return }
         let mouse = NSEvent.mouseLocation
         let screen = NSScreen.screens.first { $0.frame.contains(mouse) }?.visibleFrame
                   ?? NSScreen.main?.visibleFrame
                   ?? NSRect(x: 0, y: 0, width: 1440, height: 900)
         let x = screen.midX - width / 2
-        let y = screen.minY + 90
-        w.setFrameOrigin(NSPoint(x: x, y: y))
+        let y = screen.minY + bottomInset
+        w.setFrame(NSRect(x: x, y: y, width: width, height: height), display: true)
     }
 
     func show() {
         DispatchQueue.main.async {
             if self.window == nil { self.build() }
             self.label?.stringValue = "Listening…"
-            self.reposition()
+            self.reposition(height: self.minHeight)
             self.window?.orderFrontRegardless()   // show WITHOUT taking focus
         }
     }
@@ -153,9 +175,30 @@ final class LiveHUD {
         DispatchQueue.main.async {
             guard let label = self.label else { return }
             let t = text.trimmingCharacters(in: .whitespacesAndNewlines)
-            // Keep the most recent words visible rather than growing forever.
-            let shown = t.count > 300 ? "…" + String(t.suffix(300)) : t
-            label.stringValue = shown.isEmpty ? "Listening…" : shown
+            let shown = t.isEmpty ? "Listening…" : t
+
+            // Grow to fit. Only once we hit maxHeight do we start dropping the
+            // oldest words, so short and medium dictations are fully visible
+            // instead of being clipped to a few lines.
+            var display = shown
+            var h = self.heightFor(display)
+            if h >= self.maxHeight {
+                // Trim from the front until it fits the cap, keeping the newest
+                // text — that's the part the user is still speaking.
+                var chars = Array(display)
+                while chars.count > 80 {
+                    chars.removeFirst(min(40, chars.count - 80))
+                    let candidate = "…" + String(chars)
+                    if self.heightFor(candidate) < self.maxHeight {
+                        display = candidate
+                        break
+                    }
+                    display = candidate
+                }
+                h = self.heightFor(display)
+            }
+            label.stringValue = display
+            self.reposition(height: h)
         }
     }
 
@@ -195,11 +238,13 @@ final class RealtimeSession {
     // speech_started/stopped bracket each utterance, and they arrive in order,
     // so a FIFO of "was this utterance preceded by a long pause?" lines up with
     // the transcription-completed events.
-    // Inferred from gaps between delta events rather than VAD speech events
-    // (unsupported by this model). Delta arrival is jittery, so this is a little
-    // less precise than VAD was — gaps are logged so the threshold can be tuned.
-    static let pauseBreakSeconds = 1.0
-    private var lastDeltaAt: Date? = nil
+    // NOTE: paragraph breaks are deliberately NOT inserted here. Timing-based
+    // detection was tried twice and both attempts were wrong: VAD speech events
+    // aren't available for this model, and gaps between delta arrivals measure
+    // the model's processing rhythm rather than the speaker's pauses, so even a
+    // brief hesitation produced a break. Paragraphing is now done by the
+    // translate step in dictate.py, which can see the whole text and split on
+    // meaning instead of milliseconds.
 
     init(key: String) {
         let url = URL(string: "wss://api.openai.com/v1/realtime?intent=transcription")!
@@ -323,22 +368,10 @@ final class RealtimeSession {
             let d = obj["delta"] as? String ?? ""
             if d.isEmpty { return }
             lock.lock()
-            var gap = 0.0
-            if let last = lastDeltaAt { gap = -last.timeIntervalSinceNow }
-            let isBreak = lastDeltaAt != nil && gap >= Self.pauseBreakSeconds
-                          && !transcript.isEmpty
-            if isBreak {
-                // Blank line between thoughts; drop the delta's leading space so
-                // the new paragraph doesn't start indented.
-                transcript += "\n\n" + String(d.drop(while: { $0 == " " }))
-            } else {
-                transcript += d
-            }
-            lastDeltaAt = Date()
+            transcript += d
             lastActivity = Date()
             let live = transcript
             lock.unlock()
-            if isBreak { log(String(format: "pause %.2fs → paragraph break", gap)) }
             LiveHUD.shared.update(live)
         case "error":
             // Server VAD usually commits every utterance on its own, so our
