@@ -1,19 +1,26 @@
-// record_realtime.swift — streaming voice-recording daemon (Stage 1).
+// record_realtime.swift — streaming voice-recording daemon.
 //
 // A parallel alternative to record.swift: instead of writing an m4a file and
 // uploading it after release, it streams live mic audio to OpenAI's realtime
 // transcription WebSocket DURING the hold, so the (Russian) transcript is ready
 // the instant the key is released. dictate.py then translates + pastes.
 //
+// It also shows a live caption HUD while you speak (see LiveHUD). The HUD is our
+// own floating window and nothing is typed into the target app during dictation,
+// so it behaves identically in every app — the only interaction with the app
+// remains the single final paste.
+//
 // Trigger is identical to record.swift: Karabiner touches /tmp/rewrite_record_start
 // on press and removes it on release. On release this daemon writes the transcript
 // to /tmp/rewrite_transcript.txt and touches /tmp/rewrite_record.ready.
 //
-// The API key comes from the environment (OPENAI_API_KEY), set via the
-// LaunchAgent plist — a launchd daemon can't read ~/Documents/.env (TCC).
+// The API key is read from ~/Library/Application Support/Echo/openai_key (env
+// var also honoured). It canNOT come from ~/Documents/.env — TCC blocks that for
+// a launchd/LaunchServices process — and `open -Wg`, which the LaunchAgent needs
+// for the app to hold a Microphone grant, drops environment variables anyway.
 //
 // record.swift + the whisper-1 path stay intact; this runs only when its own
-// LaunchAgent is loaded (and dictate.py is in realtime mode).
+// LaunchAgent is loaded (and dictate.py has REALTIME_MODE = True).
 
 import AVFoundation
 import AppKit
@@ -64,6 +71,99 @@ guard let apiKey = resolveAPIKey() else {
     exit(1)
 }
 
+// ── Live caption HUD ─────────────────────────────────────────────────────────
+// Shows what you're saying, as you say it, in our OWN floating window. Nothing
+// is typed into the target app while dictating, so this is completely
+// independent of how any given app's input behaves — the only interaction with
+// the app remains the single final paste that dictate.py already does.
+//
+// Non-activating + click-through, so the caret stays in the user's input field.
+final class LiveHUD {
+    static let shared = LiveHUD()
+
+    private var window: NSWindow?
+    private var label: NSTextField?
+    private let width: CGFloat = 620
+    private let height: CGFloat = 92
+
+    private func build() {
+        let w = NSWindow(contentRect: NSRect(x: 0, y: 0, width: width, height: height),
+                         styleMask: [.borderless, .nonactivatingPanel],
+                         backing: .buffered, defer: false)
+        w.isOpaque = false
+        w.backgroundColor = .clear
+        w.level = .floating                 // above normal windows
+        w.ignoresMouseEvents = true         // clicks pass through
+        w.hasShadow = true
+        // Follow the user across Spaces / over fullscreen apps.
+        w.collectionBehavior = [.canJoinAllSpaces, .fullScreenAuxiliary, .stationary]
+
+        let bg = NSVisualEffectView(frame: NSRect(x: 0, y: 0, width: width, height: height))
+        bg.material = .hudWindow
+        bg.blendingMode = .behindWindow
+        bg.state = .active
+        bg.wantsLayer = true
+        bg.layer?.cornerRadius = 14
+        bg.layer?.masksToBounds = true
+
+        let tf = NSTextField(frame: NSRect(x: 18, y: 14, width: width - 36, height: height - 28))
+        tf.isEditable = false
+        tf.isSelectable = false
+        tf.isBordered = false
+        tf.drawsBackground = false
+        tf.font = .systemFont(ofSize: 16, weight: .medium)
+        tf.textColor = .labelColor
+        tf.lineBreakMode = .byWordWrapping
+        tf.usesSingleLineMode = false
+        tf.cell?.wraps = true
+        tf.cell?.isScrollable = false
+        tf.maximumNumberOfLines = 3
+        tf.stringValue = "Listening…"
+        tf.alignment = .left
+
+        bg.addSubview(tf)
+        w.contentView = bg
+        window = w
+        label = tf
+    }
+
+    /// Place at the bottom-centre of whichever screen holds the pointer — like
+    /// live captions. Avoids covering the input the user is looking at.
+    private func reposition() {
+        guard let w = window else { return }
+        let mouse = NSEvent.mouseLocation
+        let screen = NSScreen.screens.first { $0.frame.contains(mouse) }?.visibleFrame
+                  ?? NSScreen.main?.visibleFrame
+                  ?? NSRect(x: 0, y: 0, width: 1440, height: 900)
+        let x = screen.midX - width / 2
+        let y = screen.minY + 90
+        w.setFrameOrigin(NSPoint(x: x, y: y))
+    }
+
+    func show() {
+        DispatchQueue.main.async {
+            if self.window == nil { self.build() }
+            self.label?.stringValue = "Listening…"
+            self.reposition()
+            self.window?.orderFrontRegardless()   // show WITHOUT taking focus
+        }
+    }
+
+    func update(_ text: String) {
+        DispatchQueue.main.async {
+            guard let label = self.label else { return }
+            let t = text.trimmingCharacters(in: .whitespacesAndNewlines)
+            // Keep the most recent words visible rather than growing forever.
+            let shown = t.count > 300 ? "…" + String(t.suffix(300)) : t
+            label.stringValue = shown.isEmpty ? "Listening…" : shown
+        }
+    }
+
+    func hide() {
+        DispatchQueue.main.async { self.window?.orderOut(nil) }
+    }
+}
+
 // ── Realtime WebSocket session ───────────────────────────────────────────────
 final class RealtimeSession {
     static let model = "gpt-4o-transcribe"
@@ -91,6 +191,16 @@ final class RealtimeSession {
     static let pauseBreakSeconds = 0.8
     private var lastSpeechStop: Date? = nil
     private var pauseFlags: [Bool] = []
+
+    // Partial text for the utterance currently being spoken (live HUD only).
+    private var deltaBuffer = ""
+
+    /// Caller must hold `lock`. What the user has said so far, including the
+    /// words still in flight — this is what the HUD shows.
+    private func liveTextLocked() -> String {
+        if deltaBuffer.isEmpty { return transcript }
+        return transcript.isEmpty ? deltaBuffer : transcript + " " + deltaBuffer
+    }
 
     init(key: String) {
         let url = URL(string: "wss://api.openai.com/v1/realtime?intent=transcription")!
@@ -228,12 +338,24 @@ final class RealtimeSession {
                     transcript += (precededByPause ? "\n\n" : " ") + seg
                 }
             }
+            // This utterance is final now, so the partial text is superseded.
+            deltaBuffer = ""
             lastActivity = Date()
             let (c, d) = (committedCount, completedCount)
+            let live = liveTextLocked()
             lock.unlock()
+            LiveHUD.shared.update(live)
             log("segment \(d)/\(c)\(precededByPause ? " [break]" : ""): \(seg.isEmpty ? "(empty)" : seg)")
         case "conversation.item.input_audio_transcription.delta":
-            lock.lock(); lastActivity = Date(); lock.unlock()
+            // Partial words for the utterance in flight — used only for the live
+            // HUD; the authoritative text is the completed segment below.
+            let d = obj["delta"] as? String ?? ""
+            lock.lock()
+            deltaBuffer += d
+            lastActivity = Date()
+            let live = liveTextLocked()
+            lock.unlock()
+            LiveHUD.shared.update(live)
         case "error":
             // Server VAD usually commits every utterance on its own, so our
             // final explicit commit often finds an empty buffer. That's
@@ -289,6 +411,8 @@ func startRecording() {
     try? FileManager.default.removeItem(atPath: readyFlag)
     try? FileManager.default.removeItem(atPath: transcriptPath)
 
+    LiveHUD.shared.show()
+
     let s = RealtimeSession(key: apiKey)
     s.start()
     session = s
@@ -325,6 +449,7 @@ func stopRecording() {
     // Committing an empty buffer is an API error; skip it and hand off empty.
     if bytes < 4800 {          // < 100ms at 24kHz/16-bit
         log("too little audio (\(bytes) bytes) — skipping commit")
+        LiveHUD.shared.hide()
         try? "".write(toFile: transcriptPath, atomically: true, encoding: .utf8)
         FileManager.default.createFile(atPath: readyFlag, contents: Data())
         s.close(); session = nil
@@ -354,6 +479,9 @@ func stopRecording() {
         try? text.write(toFile: transcriptPath, atomically: true, encoding: .utf8)
         FileManager.default.createFile(atPath: readyFlag, contents: Data())
         log("handoff: \(text.count) chars (\(d)/\(c) segments)")
+        // Keep the HUD up until the text is handed off, then let dictate.py's
+        // translate + paste take over.
+        LiveHUD.shared.hide()
         s.close()
     }
     session = nil
@@ -365,6 +493,7 @@ func stopRecording() {
 // immune to whether AppKit is servicing the main run loop in this launch
 // context (a Timer silently never fired when launched outside launchd).
 let pollThread = Thread {
+    log("poll thread running")
     var recording = false
     while true {
         let want = FileManager.default.fileExists(atPath: startFlag)
@@ -393,6 +522,9 @@ for sig in [SIGTERM, SIGINT, SIGHUP] {
 }
 
 log("record_realtime daemon started")
-// Keep the process alive. The poll thread does the work; the main run loop only
-// needs to service the WebSocket/audio callbacks.
-while true { RunLoop.main.run(until: Date().addingTimeInterval(1.0)) }
+// A real NSApplication run loop, needed to draw the live HUD. Safe now that the
+// flag polling lives on its own thread — an earlier main-run-loop Timer was
+// what silently never fired. .accessory = no dock icon, no menu bar.
+let app = NSApplication.shared
+app.setActivationPolicy(.accessory)
+app.run()
