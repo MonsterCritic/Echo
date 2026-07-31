@@ -83,6 +83,15 @@ final class RealtimeSession {
     private var completedCount = 0
     private var commitRejected = false
 
+    // Pause tracking: a noticeable silence between utterances almost always
+    // means a new thought, so it becomes a line break instead of a space.
+    // speech_started/stopped bracket each utterance, and they arrive in order,
+    // so a FIFO of "was this utterance preceded by a long pause?" lines up with
+    // the transcription-completed events.
+    static let pauseBreakSeconds = 0.8
+    private var lastSpeechStop: Date? = nil
+    private var pauseFlags: [Bool] = []
+
     init(key: String) {
         let url = URL(string: "wss://api.openai.com/v1/realtime?intent=transcription")!
         var req = URLRequest(url: url)
@@ -183,6 +192,20 @@ final class RealtimeSession {
         switch type {
         case "session.updated":
             flushPending()
+        case "input_audio_buffer.speech_started":
+            // Measure the silence since the previous utterance ended.
+            lock.lock()
+            var gap = 0.0
+            if let stop = lastSpeechStop { gap = -stop.timeIntervalSinceNow }
+            let isBreak = lastSpeechStop != nil && gap >= Self.pauseBreakSeconds
+            pauseFlags.append(isBreak)
+            lock.unlock()
+            if lastSpeechStop != nil {
+                log(String(format: "pause before utterance: %.2fs → %@",
+                           gap, isBreak ? "line break" : "same line"))
+            }
+        case "input_audio_buffer.speech_stopped":
+            lock.lock(); lastSpeechStop = Date(); lock.unlock()
         case "input_audio_buffer.committed":
             lock.lock(); committedCount += 1; let n = committedCount; lock.unlock()
             log("utterance committed (#\(n)) — awaiting its transcription")
@@ -191,15 +214,22 @@ final class RealtimeSession {
                       .trimmingCharacters(in: .whitespacesAndNewlines)
             lock.lock()
             completedCount += 1
+            // Pop this utterance's pause flag (FIFO, same order as the events).
+            let precededByPause = pauseFlags.isEmpty ? false : pauseFlags.removeFirst()
             if !seg.isEmpty {
-                // Server VAD emits one segment per utterance; join with a space
-                // so sentences don't run together ("...инпуте?Интересно.").
-                transcript += transcript.isEmpty ? seg : " " + seg
+                // One segment per utterance. A long pause before it means a new
+                // thought → line break; otherwise just a space so sentences
+                // don't run together ("...инпуте?Интересно.").
+                if transcript.isEmpty {
+                    transcript = seg
+                } else {
+                    transcript += (precededByPause ? "\n" : " ") + seg
+                }
             }
             lastActivity = Date()
             let (c, d) = (committedCount, completedCount)
             lock.unlock()
-            log("segment \(d)/\(c): \(seg.isEmpty ? "(empty)" : seg)")
+            log("segment \(d)/\(c)\(precededByPause ? " [break]" : ""): \(seg.isEmpty ? "(empty)" : seg)")
         case "conversation.item.input_audio_transcription.delta":
             lock.lock(); lastActivity = Date(); lock.unlock()
         case "error":
