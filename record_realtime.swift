@@ -166,7 +166,14 @@ final class LiveHUD {
 
 // ── Realtime WebSocket session ───────────────────────────────────────────────
 final class RealtimeSession {
-    static let model = "gpt-4o-transcribe"
+    // gpt-live-transcribe streams transcript deltas AS SPEECH ARRIVES, which is
+    // what makes the live HUD actually live. gpt-4o-transcribe only emits text
+    // once an utterance has been committed, so nothing appeared until you
+    // paused. The trade-off: this model rejects turn_detection ("Turn detection
+    // is not supported for this transcription model"), so there are no
+    // speech_started/stopped events and pauses are inferred from gaps between
+    // deltas instead.
+    static let model = "gpt-live-transcribe"
     static let lang  = "ru"
 
     private let ws: URLSessionWebSocketTask
@@ -188,19 +195,11 @@ final class RealtimeSession {
     // speech_started/stopped bracket each utterance, and they arrive in order,
     // so a FIFO of "was this utterance preceded by a long pause?" lines up with
     // the transcription-completed events.
-    static let pauseBreakSeconds = 0.8
-    private var lastSpeechStop: Date? = nil
-    private var pauseFlags: [Bool] = []
-
-    // Partial text for the utterance currently being spoken (live HUD only).
-    private var deltaBuffer = ""
-
-    /// Caller must hold `lock`. What the user has said so far, including the
-    /// words still in flight — this is what the HUD shows.
-    private func liveTextLocked() -> String {
-        if deltaBuffer.isEmpty { return transcript }
-        return transcript.isEmpty ? deltaBuffer : transcript + " " + deltaBuffer
-    }
+    // Inferred from gaps between delta events rather than VAD speech events
+    // (unsupported by this model). Delta arrival is jittery, so this is a little
+    // less precise than VAD was — gaps are logged so the threshold can be tuned.
+    static let pauseBreakSeconds = 1.0
+    private var lastDeltaAt: Date? = nil
 
     init(key: String) {
         let url = URL(string: "wss://api.openai.com/v1/realtime?intent=transcription")!
@@ -220,16 +219,8 @@ final class RealtimeSession {
                 "audio": ["input": [
                     "format": ["type": "audio/pcm", "rate": 24000],
                     "transcription": ["model": Self.model, "language": Self.lang],
-                    // Default silence_duration_ms is 200, which splits on natural
-                    // micro-pauses and yields useless fragments ("А", "Эм") with
-                    // poor accuracy. Longer silence = fewer, more coherent
-                    // utterances and better context for the model.
-                    "turn_detection": [
-                        "type": "server_vad",
-                        "threshold": 0.5,
-                        "prefix_padding_ms": 300,
-                        "silence_duration_ms": 700,
-                    ],
+                    // No turn_detection here: gpt-live-transcribe rejects it.
+                    // Pauses are detected from gaps between delta events.
                 ]],
             ],
         ])
@@ -302,59 +293,52 @@ final class RealtimeSession {
         switch type {
         case "session.updated":
             flushPending()
-        case "input_audio_buffer.speech_started":
-            // Measure the silence since the previous utterance ended.
-            lock.lock()
-            var gap = 0.0
-            if let stop = lastSpeechStop { gap = -stop.timeIntervalSinceNow }
-            let isBreak = lastSpeechStop != nil && gap >= Self.pauseBreakSeconds
-            pauseFlags.append(isBreak)
-            lock.unlock()
-            if lastSpeechStop != nil {
-                log(String(format: "pause before utterance: %.2fs → %@",
-                           gap, isBreak ? "line break" : "same line"))
-            }
-        case "input_audio_buffer.speech_stopped":
-            lock.lock(); lastSpeechStop = Date(); lock.unlock()
         case "input_audio_buffer.committed":
             lock.lock(); committedCount += 1; let n = committedCount; lock.unlock()
             log("utterance committed (#\(n)) — awaiting its transcription")
         case "conversation.item.input_audio_transcription.completed":
+            // The deltas already built the transcript (with paragraph breaks),
+            // so this is a safety net: only adopt the server's version if we
+            // somehow received no deltas at all. Its text is otherwise identical
+            // but flattened onto one line.
             let seg = (obj["transcript"] as? String ?? "")
                       .trimmingCharacters(in: .whitespacesAndNewlines)
             lock.lock()
             completedCount += 1
-            // Pop this utterance's pause flag (FIFO, same order as the events).
-            let precededByPause = pauseFlags.isEmpty ? false : pauseFlags.removeFirst()
-            if !seg.isEmpty {
-                // One segment per utterance. A long pause before it means a new
-                // thought → line break; otherwise just a space so sentences
-                // don't run together ("...инпуте?Интересно.").
-                if transcript.isEmpty {
-                    transcript = seg
-                } else {
-                    // Blank line between thoughts (paragraph break), plain space
-                    // when the speaker just took a breath mid-sentence.
-                    transcript += (precededByPause ? "\n\n" : " ") + seg
-                }
+            if transcript.isEmpty && !seg.isEmpty {
+                transcript = seg
+                log("no deltas arrived — using the completed transcript")
             }
-            // This utterance is final now, so the partial text is superseded.
-            deltaBuffer = ""
             lastActivity = Date()
             let (c, d) = (committedCount, completedCount)
-            let live = liveTextLocked()
+            let live = transcript
             lock.unlock()
             LiveHUD.shared.update(live)
-            log("segment \(d)/\(c)\(precededByPause ? " [break]" : ""): \(seg.isEmpty ? "(empty)" : seg)")
+            log("utterance transcribed \(d)/\(c) (\(seg.count) chars)")
         case "conversation.item.input_audio_transcription.delta":
-            // Partial words for the utterance in flight — used only for the live
-            // HUD; the authoritative text is the completed segment below.
+            // Deltas stream as speech arrives and are purely additive, so they
+            // ARE the transcript — we build it here rather than waiting for the
+            // completed event. That also lets us mark pauses: a gap in delta
+            // arrival means the speaker stopped talking, i.e. a new thought.
             let d = obj["delta"] as? String ?? ""
+            if d.isEmpty { return }
             lock.lock()
-            deltaBuffer += d
+            var gap = 0.0
+            if let last = lastDeltaAt { gap = -last.timeIntervalSinceNow }
+            let isBreak = lastDeltaAt != nil && gap >= Self.pauseBreakSeconds
+                          && !transcript.isEmpty
+            if isBreak {
+                // Blank line between thoughts; drop the delta's leading space so
+                // the new paragraph doesn't start indented.
+                transcript += "\n\n" + String(d.drop(while: { $0 == " " }))
+            } else {
+                transcript += d
+            }
+            lastDeltaAt = Date()
             lastActivity = Date()
-            let live = liveTextLocked()
+            let live = transcript
             lock.unlock()
+            if isBreak { log(String(format: "pause %.2fs → paragraph break", gap)) }
             LiveHUD.shared.update(live)
         case "error":
             // Server VAD usually commits every utterance on its own, so our
