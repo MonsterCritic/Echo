@@ -75,6 +75,13 @@ final class RealtimeSession {
     private var pending: [Data] = []       // audio captured before session.updated
     private(set) var transcript = ""       // concatenated final segments
     private var lastActivity = Date()
+    // Every committed utterance produces exactly one transcription. Counting
+    // both lets stopRecording wait for the LAST segment instead of guessing
+    // from "the transcript stopped growing" — which bailed early after a pause
+    // and silently dropped the tail of the dictation.
+    private var committedCount = 0
+    private var completedCount = 0
+    private var commitRejected = false
 
     init(key: String) {
         let url = URL(string: "wss://api.openai.com/v1/realtime?intent=transcription")!
@@ -94,6 +101,16 @@ final class RealtimeSession {
                 "audio": ["input": [
                     "format": ["type": "audio/pcm", "rate": 24000],
                     "transcription": ["model": Self.model, "language": Self.lang],
+                    // Default silence_duration_ms is 200, which splits on natural
+                    // micro-pauses and yields useless fragments ("А", "Эм") with
+                    // poor accuracy. Longer silence = fewer, more coherent
+                    // utterances and better context for the model.
+                    "turn_detection": [
+                        "type": "server_vad",
+                        "threshold": 0.5,
+                        "prefix_padding_ms": 300,
+                        "silence_duration_ms": 700,
+                    ],
                 ]],
             ],
         ])
@@ -119,6 +136,24 @@ final class RealtimeSession {
     func commit() { sendJSON(["type": "input_audio_buffer.commit"]) }
     func close()  { ws.cancel(with: .normalClosure, reason: nil) }
     func idleSeconds() -> TimeInterval { -lastActivity.timeIntervalSinceNow }
+
+    /// True once every committed utterance has come back transcribed.
+    func allSegmentsTranscribed() -> Bool {
+        lock.lock(); defer { lock.unlock() }
+        return completedCount >= committedCount
+    }
+
+    func segmentCounts() -> (committed: Int, completed: Int) {
+        lock.lock(); defer { lock.unlock() }
+        return (committedCount, completedCount)
+    }
+
+    /// Set when a commit is rejected for an empty buffer — that commit will
+    /// never produce a transcription, so nothing should wait for it.
+    func sawRejectedCommit() -> Bool {
+        lock.lock(); defer { lock.unlock() }
+        return commitRejected
+    }
 
     private func flushPending() {
         lock.lock(); let buffered = pending; pending = []; configured = true; lock.unlock()
@@ -148,19 +183,23 @@ final class RealtimeSession {
         switch type {
         case "session.updated":
             flushPending()
+        case "input_audio_buffer.committed":
+            lock.lock(); committedCount += 1; let n = committedCount; lock.unlock()
+            log("utterance committed (#\(n)) — awaiting its transcription")
         case "conversation.item.input_audio_transcription.completed":
-            if let t = obj["transcript"] as? String {
-                let seg = t.trimmingCharacters(in: .whitespacesAndNewlines)
-                if !seg.isEmpty {
-                    lock.lock()
-                    // Server VAD emits one segment per utterance; join with a
-                    // space so sentences don't run together ("...инпуте?Интересно.").
-                    transcript += transcript.isEmpty ? seg : " " + seg
-                    lastActivity = Date()
-                    lock.unlock()
-                    log("segment: \(seg)")
-                }
+            let seg = (obj["transcript"] as? String ?? "")
+                      .trimmingCharacters(in: .whitespacesAndNewlines)
+            lock.lock()
+            completedCount += 1
+            if !seg.isEmpty {
+                // Server VAD emits one segment per utterance; join with a space
+                // so sentences don't run together ("...инпуте?Интересно.").
+                transcript += transcript.isEmpty ? seg : " " + seg
             }
+            lastActivity = Date()
+            let (c, d) = (committedCount, completedCount)
+            lock.unlock()
+            log("segment \(d)/\(c): \(seg.isEmpty ? "(empty)" : seg)")
         case "conversation.item.input_audio_transcription.delta":
             lock.lock(); lastActivity = Date(); lock.unlock()
         case "error":
@@ -168,6 +207,7 @@ final class RealtimeSession {
             // final explicit commit often finds an empty buffer. That's
             // expected and harmless — don't log it as an error.
             if s.contains("input_audio_buffer_commit_empty") {
+                lock.lock(); commitRejected = true; lock.unlock()
                 log("final commit had nothing left (VAD already committed) — ok")
             } else {
                 log("API error: \(s)")
@@ -260,22 +300,28 @@ func stopRecording() {
     }
     s.commit()
 
-    // Wait briefly for the final segment(s) to transcribe, then hand off. We
-    // poll for the transcript to stop growing (or a hard cap), so short clips
-    // return fast and long ones still finish.
+    // Wait for EVERY committed utterance to come back transcribed before handing
+    // off. The previous heuristic ("transcript stopped growing and went quiet")
+    // bailed ~150ms after release whenever the user had paused, silently losing
+    // the tail of the dictation. Now we wait on the actual segment count.
     DispatchQueue.global().async {
-        let deadline = Date().addingTimeInterval(4.0)
-        var lastLen = -1
+        // Give the trailing commit a moment to register before we compare counts.
+        usleep(250_000)
+        let deadline = Date().addingTimeInterval(10.0)
         while Date() < deadline {
-            let cur = s.transcript.count
-            if cur > 0 && cur == lastLen && s.idleSeconds() > 0.6 { break }
-            lastLen = cur
-            usleep(150_000)
+            if s.allSegmentsTranscribed() {
+                // All known utterances are in. Allow a brief grace period in case
+                // the server is still opening one more segment for trailing audio.
+                if s.idleSeconds() > 0.5 { break }
+            }
+            usleep(100_000)
         }
+        let (c, d) = s.segmentCounts()
+        if d < c { log("WARNING: timed out with \(d)/\(c) segments transcribed") }
         let text = s.transcript.trimmingCharacters(in: .whitespacesAndNewlines)
         try? text.write(toFile: transcriptPath, atomically: true, encoding: .utf8)
         FileManager.default.createFile(atPath: readyFlag, contents: Data())
-        log("handoff: \(text.count) chars")
+        log("handoff: \(text.count) chars (\(d)/\(c) segments)")
         s.close()
     }
     session = nil
