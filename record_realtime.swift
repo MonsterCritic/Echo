@@ -223,7 +223,9 @@ final class RealtimeSession {
                 if transcript.isEmpty {
                     transcript = seg
                 } else {
-                    transcript += (precededByPause ? "\n" : " ") + seg
+                    // Blank line between thoughts (paragraph break), plain space
+                    // when the speaker just took a breath mid-sentence.
+                    transcript += (precededByPause ? "\n\n" : " ") + seg
                 }
             }
             lastActivity = Date()
