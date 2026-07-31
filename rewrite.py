@@ -273,6 +273,8 @@ if __name__ == "__main__":
     try:
         main()
     finally:
+        # The Automator Quick Action's "Run Shell Script" can otherwise linger
+        # after the script finishes; killing our parent ends it promptly.
         import os, signal
         try:
             os.kill(os.getppid(), signal.SIGTERM)

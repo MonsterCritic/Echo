@@ -21,3 +21,4 @@ paste_helper
 __pycache__/
 *.pyc
 *.swp
+record_realtime.app/
