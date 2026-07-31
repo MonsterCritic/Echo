@@ -12,9 +12,37 @@ let historyPath = NSString(string: "~/Documents/context-helper/dictate_history.m
                   .expandingTildeInPath
 let historyURL  = URL(fileURLWithPath: historyPath)
 
+// ── AI Speak control ─────────────────────────────────────────────────────────
+// speak.py writes its PID here and puts itself in its own process group, so the
+// whole pipeline (synthesis thread + afplay child) can be killed at once. This
+// is the same mechanism a second Cmd+Globe uses; we just expose it as a menu
+// item so playback can be stopped by mouse too.
+let speakPIDPath = "/tmp/rewrite_speak.pid"
+
+/// The live speak.py process, or nil if nothing is playing.
+func speakingPID() -> pid_t? {
+    guard let s = try? String(contentsOfFile: speakPIDPath, encoding: .utf8),
+          let pid = pid_t(s.trimmingCharacters(in: .whitespacesAndNewlines)),
+          pid > 0 else { return nil }
+    return kill(pid, 0) == 0 ? pid : nil     // signal 0 = liveness check only
+}
+
+func stopSpeaking() {
+    guard let pid = speakingPID() else { return }
+    let pgid = getpgid(pid)
+    if pgid > 0 {
+        killpg(pgid, SIGTERM)                // kills afplay + pending synthesis
+    } else {
+        kill(pid, SIGTERM)
+    }
+    try? FileManager.default.removeItem(atPath: speakPIDPath)
+}
+
 class StatusController: NSObject, NSMenuDelegate {
     var item: NSStatusItem!
     let menu = NSMenu()
+    private var showingSpeakingIcon = false
+    private var iconTimer: Timer?
 
     func install() {
         item = NSStatusBar.system.statusItem(withLength: NSStatusItem.variableLength)
@@ -30,10 +58,28 @@ class StatusController: NSObject, NSMenuDelegate {
         // reflects the actual most-recent dictation.
         menu.delegate = self
         rebuildMenu()
+
+        // Poll for playback so the icon reflects it. Cheap: a stat + a signal-0
+        // liveness check once a second, and the icon is only redrawn on change.
+        iconTimer = Timer.scheduledTimer(withTimeInterval: 1.0, repeats: true) { [weak self] _ in
+            self?.refreshIcon()
+        }
+        if let t = iconTimer { RunLoop.main.add(t, forMode: .common) }
     }
 
     func rebuildMenu() {
         menu.removeAllItems()
+
+        // Only offered while something is actually playing, so the menu doesn't
+        // carry a dead action the rest of the time.
+        if speakingPID() != nil {
+            let stopItem = NSMenuItem(title: "Stop Speaking",
+                                      action: #selector(stopSpeech),
+                                      keyEquivalent: ".")
+            stopItem.target = self
+            menu.addItem(stopItem)
+            menu.addItem(NSMenuItem.separator())
+        }
 
         let last = lastFinal()
         let preview = last.flatMap { previewText($0) }
@@ -111,6 +157,23 @@ class StatusController: NSObject, NSMenuDelegate {
         if oneLine.count <= maxLen { return oneLine }
         let idx = oneLine.index(oneLine.startIndex, offsetBy: maxLen)
         return String(oneLine[..<idx]) + "…"
+    }
+
+    @objc func stopSpeech() {
+        stopSpeaking()
+        refreshIcon()
+    }
+
+    /// Swap the menubar glyph while speech is playing, so it's visible that
+    /// playback is running (and therefore that Stop Speaking is available).
+    func refreshIcon() {
+        guard let button = item.button else { return }
+        let speaking = speakingPID() != nil
+        if speaking == showingSpeakingIcon { return }   // avoid needless redraws
+        showingSpeakingIcon = speaking
+        let name = speaking ? "speaker.wave.2.fill" : "waveform"
+        let desc = speaking ? "Speaking — click menu to stop" : "Dictation History"
+        button.image = NSImage(systemSymbolName: name, accessibilityDescription: desc)
     }
 
     @objc func copyLast() {
