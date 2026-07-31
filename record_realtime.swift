@@ -85,14 +85,17 @@ final class LiveHUD {
     private var label: NSTextField?
     private var bgView: NSVisualEffectView?
     private let width: CGFloat = 760
-    private let minHeight: CGFloat = 56
-    private let maxHeight: CGFloat = 420
+    // Fixed height, deliberately. Growing the panel meant a synchronous
+    // setFrame(display:) every time the text wrapped, which stalled the main
+    // thread mid-speech and made a whole line appear at once. A constant-size
+    // panel never resizes, so rendering can't hitch; text scrolls up within it.
+    private let panelHeight: CGFloat = 150      // ~5 lines at 16pt
     private let padX: CGFloat = 18
-    private let padY: CGFloat = 14
+    private let padY: CGFloat = 12
     private let bottomInset: CGFloat = 90
 
     private func build() {
-        let w = NSWindow(contentRect: NSRect(x: 0, y: 0, width: width, height: minHeight),
+        let w = NSWindow(contentRect: NSRect(x: 0, y: 0, width: width, height: panelHeight),
                          styleMask: [.borderless, .nonactivatingPanel],
                          backing: .buffered, defer: false)
         w.isOpaque = false
@@ -103,7 +106,7 @@ final class LiveHUD {
         // Follow the user across Spaces / over fullscreen apps.
         w.collectionBehavior = [.canJoinAllSpaces, .fullScreenAuxiliary, .stationary]
 
-        let bg = NSVisualEffectView(frame: NSRect(x: 0, y: 0, width: width, height: minHeight))
+        let bg = NSVisualEffectView(frame: NSRect(x: 0, y: 0, width: width, height: panelHeight))
         bg.material = .hudWindow
         bg.blendingMode = .behindWindow
         bg.state = .active
@@ -114,7 +117,7 @@ final class LiveHUD {
 
         let tf = NSTextField(frame: NSRect(x: padX, y: padY,
                                           width: width - padX * 2,
-                                          height: minHeight - padY * 2))
+                                          height: panelHeight - padY * 2))
         tf.isEditable = false
         tf.isSelectable = false
         tf.isBordered = false
@@ -137,21 +140,22 @@ final class LiveHUD {
         bgView = bg
     }
 
-    /// Height needed to render `text` at our fixed width.
+    /// Height `text` needs at our fixed width, measured with the field's own cell
+    /// (which accounts for its internal insets, unlike NSString.boundingRect).
     private func heightFor(_ text: String) -> CGFloat {
-        guard let font = label?.font else { return minHeight }
-        let box = NSSize(width: width - padX * 2, height: .greatestFiniteMagnitude)
-        let rect = (text as NSString).boundingRect(
-            with: box,
-            options: [.usesLineFragmentOrigin, .usesFontLeading],
-            attributes: [.font: font])
-        return min(max(ceil(rect.height) + padY * 2, minHeight), maxHeight)
+        guard let lbl = label, let cell = lbl.cell as? NSTextFieldCell else { return 0 }
+        let saved = cell.stringValue
+        cell.stringValue = text
+        let bounds = NSRect(x: 0, y: 0, width: lbl.frame.width, height: 100_000)
+        let needed = cell.cellSize(forBounds: bounds).height
+        cell.stringValue = saved
+        return ceil(needed)
     }
 
-    /// Place at the bottom-centre of whichever screen holds the pointer — like
-    /// live captions. Avoids covering the input the user is looking at. The panel
-    /// grows upward as text accumulates, so the bottom edge stays put.
-    private func reposition(height: CGFloat) {
+    /// Bottom-centre of whichever screen holds the pointer — like live captions,
+    /// so it doesn't cover the input being typed into. Called once per session;
+    /// the panel never changes size, so this never runs mid-speech.
+    private func reposition() {
         guard let w = window else { return }
         let mouse = NSEvent.mouseLocation
         let screen = NSScreen.screens.first { $0.frame.contains(mouse) }?.visibleFrame
@@ -159,7 +163,7 @@ final class LiveHUD {
                   ?? NSRect(x: 0, y: 0, width: 1440, height: 900)
         let x = screen.midX - width / 2
         let y = screen.minY + bottomInset
-        w.setFrame(NSRect(x: x, y: y, width: width, height: height), display: true)
+        w.setFrame(NSRect(x: x, y: y, width: width, height: panelHeight), display: true)
     }
 
     func show() {
@@ -167,20 +171,16 @@ final class LiveHUD {
             if self.window == nil { self.build() }
             self.label?.stringValue = "Listening…"
             self.pendingText = nil
-            self.currentHeight = self.minHeight
-            self.reposition(height: self.minHeight)
+            self.reposition()
             self.window?.orderFrontRegardless()   // show WITHOUT taking focus
         }
     }
 
     /// Latest text awaiting display, and whether a flush is already queued.
-    /// Deltas can arrive faster than the window can redraw, and doing a text
-    /// measurement + synchronous setFrame per delta made the caption stall at
-    /// each line wrap and then catch up in whole blocks. Coalescing to a fixed
-    /// interval keeps it smooth regardless of delta rate.
+    /// Deltas can arrive faster than the window can redraw, so the newest text
+    /// is applied on a fixed interval instead of once per delta.
     private var pendingText: String?
     private var flushQueued = false
-    private var currentHeight: CGFloat = 0
     private let flushInterval = 0.05
 
     func update(_ text: String) {
@@ -194,35 +194,34 @@ final class LiveHUD {
         }
     }
 
-    /// Main thread only.
+    /// Main thread only. Sets the visible text and nothing else — no measuring
+    /// of the window, no resizing, so there is no synchronous relayout to stall
+    /// on. Once the text outgrows the panel we drop words from the front, which
+    /// reads as the caption scrolling up.
     private func flush() {
         flushQueued = false
         guard let raw = pendingText, let label = label else { return }
         pendingText = nil
 
         let t = raw.trimmingCharacters(in: .whitespacesAndNewlines)
-        var display = t.isEmpty ? "Listening…" : t
+        if t.isEmpty { label.stringValue = "Listening…"; return }
 
-        // Grow to fit; only past maxHeight do we drop the oldest words, keeping
-        // the newest text — that's what the user is still saying.
-        var h = heightFor(display)
-        if h >= maxHeight {
-            var chars = Array(display)
-            while chars.count > 80 {
-                chars.removeFirst(min(40, chars.count - 80))
-                display = "…" + String(chars)
-                if heightFor(display) < maxHeight { break }
+        let fits = panelHeight - padY * 2
+        var display = t
+        if heightFor(display) > fits {
+            // Binary-search the longest suffix that still fits, so the newest
+            // words — what's being spoken right now — stay visible.
+            var lo = 0, hi = display.count
+            let chars = Array(display)
+            while lo < hi {
+                let mid = (lo + hi) / 2                     // drop `mid` chars
+                let candidate = "…" + String(chars[mid...])
+                if heightFor(candidate) > fits { lo = mid + 1 } else { hi = mid }
             }
-            h = heightFor(display)
+            display = lo >= chars.count ? String(chars.suffix(40))
+                                        : "…" + String(chars[lo...])
         }
-
         label.stringValue = display
-        // Resizing forces a synchronous redraw, so only do it when the height
-        // genuinely changed (i.e. a line was added or removed).
-        if abs(h - currentHeight) > 0.5 {
-            currentHeight = h
-            reposition(height: h)
-        }
     }
 
     func hide() {
