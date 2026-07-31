@@ -223,7 +223,13 @@ final class RealtimeSession {
     private let lock = NSLock()
     private var configured = false
     private var pending: [Data] = []       // audio captured before session.updated
-    private(set) var transcript = ""       // concatenated final segments
+    // Two texts, deliberately: `deltaText` is the fast, rougher stream used only
+    // to drive the live HUD, while `transcript` holds the server's authoritative
+    // completed transcription and is what actually gets pasted. Streaming trades
+    // accuracy for latency, so this keeps the preview snappy without degrading
+    // the result. deltaText is the fallback if no completed event arrives.
+    private(set) var transcript = ""
+    private var deltaText = ""
     private var lastActivity = Date()
     // Every committed utterance produces exactly one transcription. Counting
     // both lets stopRecording wait for the LAST segment instead of guessing
@@ -263,9 +269,18 @@ final class RealtimeSession {
                 "type": "transcription",
                 "audio": ["input": [
                     "format": ["type": "audio/pcm", "rate": 24000],
-                    "transcription": ["model": Self.model, "language": Self.lang],
+                    "transcription": [
+                        "model": Self.model,
+                        "language": Self.lang,
+                        // Deltas were arriving in slow bursts ("nothing, then a
+                        // lot at once"). `delay` trades latency for streaming
+                        // quality; "low" is what the docs recommend for live
+                        // captions. The text we actually paste comes from the
+                        // completed transcript, so a rougher live stream costs
+                        // us nothing.
+                        "delay": "low",
+                    ],
                     // No turn_detection here: gpt-live-transcribe rejects it.
-                    // Pauses are detected from gaps between delta events.
                 ]],
             ],
         ])
@@ -291,6 +306,18 @@ final class RealtimeSession {
     func commit() { sendJSON(["type": "input_audio_buffer.commit"]) }
     func close()  { ws.cancel(with: .normalClosure, reason: nil) }
     func idleSeconds() -> TimeInterval { -lastActivity.timeIntervalSinceNow }
+
+    /// The text to hand off: the server's completed transcription, or the
+    /// streamed delta text if (unexpectedly) no completed event ever arrived, so
+    /// a dictation is never silently lost.
+    func finalText() -> String {
+        lock.lock(); defer { lock.unlock() }
+        let t = transcript.trimmingCharacters(in: .whitespacesAndNewlines)
+        if !t.isEmpty { return t }
+        let d = deltaText.trimmingCharacters(in: .whitespacesAndNewlines)
+        if !d.isEmpty { log("no completed transcript — falling back to delta text") }
+        return d
+    }
 
     /// True once every committed utterance has come back transcribed.
     func allSegmentsTranscribed() -> Bool {
@@ -342,23 +369,20 @@ final class RealtimeSession {
             lock.lock(); committedCount += 1; let n = committedCount; lock.unlock()
             log("utterance committed (#\(n)) — awaiting its transcription")
         case "conversation.item.input_audio_transcription.completed":
-            // The deltas already built the transcript (with paragraph breaks),
-            // so this is a safety net: only adopt the server's version if we
-            // somehow received no deltas at all. Its text is otherwise identical
-            // but flattened onto one line.
+            // Authoritative text for this utterance — this is what gets pasted.
             let seg = (obj["transcript"] as? String ?? "")
                       .trimmingCharacters(in: .whitespacesAndNewlines)
             lock.lock()
             completedCount += 1
-            if transcript.isEmpty && !seg.isEmpty {
-                transcript = seg
-                log("no deltas arrived — using the completed transcript")
+            if !seg.isEmpty {
+                transcript += transcript.isEmpty ? seg : " " + seg
             }
             lastActivity = Date()
             let (c, d) = (committedCount, completedCount)
-            let live = transcript
+            let shown = transcript
             lock.unlock()
-            LiveHUD.shared.update(live)
+            // Show the corrected version now that it's final.
+            LiveHUD.shared.update(shown)
             log("utterance transcribed \(d)/\(c) (\(seg.count) chars)")
         case "conversation.item.input_audio_transcription.delta":
             // Deltas stream as speech arrives and are purely additive, so they
@@ -368,9 +392,9 @@ final class RealtimeSession {
             let d = obj["delta"] as? String ?? ""
             if d.isEmpty { return }
             lock.lock()
-            transcript += d
+            deltaText += d
             lastActivity = Date()
-            let live = transcript
+            let live = deltaText
             lock.unlock()
             LiveHUD.shared.update(live)
         case "error":
@@ -492,7 +516,7 @@ func stopRecording() {
         }
         let (c, d) = s.segmentCounts()
         if d < c { log("WARNING: timed out with \(d)/\(c) segments transcribed") }
-        let text = s.transcript.trimmingCharacters(in: .whitespacesAndNewlines)
+        let text = s.finalText()
         try? text.write(toFile: transcriptPath, atomically: true, encoding: .utf8)
         FileManager.default.createFile(atPath: readyFlag, contents: Data())
         log("handoff: \(text.count) chars (\(d)/\(c) segments)")
