@@ -85,17 +85,20 @@ final class LiveHUD {
     private var label: NSTextField?
     private var bgView: NSVisualEffectView?
     private let width: CGFloat = 760
-    // Fixed height, deliberately. Growing the panel meant a synchronous
-    // setFrame(display:) every time the text wrapped, which stalled the main
-    // thread mid-speech and made a whole line appear at once. A constant-size
-    // panel never resizes, so rendering can't hitch; text scrolls up within it.
-    private let panelHeight: CGFloat = 150      // ~5 lines at 16pt
+    // The panel grows with the text instead of reserving a fixed block of screen.
+    // Growth was what previously made a whole line appear at once, but the cause
+    // was specifically setFrame(display: TRUE) forcing a synchronous redraw on
+    // the main thread mid-speech. Resizing with display: false lets AppKit
+    // coalesce the redraw, so we can have both fit-to-content and smooth text.
+    private let minHeight: CGFloat = 52         // ~1 line
+    private let maxHeight: CGFloat = 420        // ~14 lines, then it scrolls
+    private var currentHeight: CGFloat = 0
     private let padX: CGFloat = 18
     private let padY: CGFloat = 12
     private let bottomInset: CGFloat = 90
 
     private func build() {
-        let w = NSWindow(contentRect: NSRect(x: 0, y: 0, width: width, height: panelHeight),
+        let w = NSWindow(contentRect: NSRect(x: 0, y: 0, width: width, height: minHeight),
                          styleMask: [.borderless, .nonactivatingPanel],
                          backing: .buffered, defer: false)
         w.isOpaque = false
@@ -106,7 +109,7 @@ final class LiveHUD {
         // Follow the user across Spaces / over fullscreen apps.
         w.collectionBehavior = [.canJoinAllSpaces, .fullScreenAuxiliary, .stationary]
 
-        let bg = NSVisualEffectView(frame: NSRect(x: 0, y: 0, width: width, height: panelHeight))
+        let bg = NSVisualEffectView(frame: NSRect(x: 0, y: 0, width: width, height: minHeight))
         bg.material = .hudWindow
         bg.blendingMode = .behindWindow
         bg.state = .active
@@ -117,7 +120,7 @@ final class LiveHUD {
 
         let tf = NSTextField(frame: NSRect(x: padX, y: padY,
                                           width: width - padX * 2,
-                                          height: panelHeight - padY * 2))
+                                          height: minHeight - padY * 2))
         tf.isEditable = false
         tf.isSelectable = false
         tf.isBordered = false
@@ -153,9 +156,13 @@ final class LiveHUD {
     }
 
     /// Bottom-centre of whichever screen holds the pointer — like live captions,
-    /// so it doesn't cover the input being typed into. Called once per session;
-    /// the panel never changes size, so this never runs mid-speech.
-    private func reposition() {
+    /// so it doesn't cover the input being typed into. The bottom edge stays put
+    /// and the panel grows upward.
+    ///
+    /// `display: false` is important: the synchronous variant forces an immediate
+    /// relayout on the main thread, which is what previously stalled the caption
+    /// at each line wrap. This way AppKit redraws on its own next cycle.
+    private func reposition(height: CGFloat) {
         guard let w = window else { return }
         let mouse = NSEvent.mouseLocation
         let screen = NSScreen.screens.first { $0.frame.contains(mouse) }?.visibleFrame
@@ -163,7 +170,7 @@ final class LiveHUD {
                   ?? NSRect(x: 0, y: 0, width: 1440, height: 900)
         let x = screen.midX - width / 2
         let y = screen.minY + bottomInset
-        w.setFrame(NSRect(x: x, y: y, width: width, height: panelHeight), display: true)
+        w.setFrame(NSRect(x: x, y: y, width: width, height: height), display: false)
     }
 
     func show() {
@@ -171,7 +178,8 @@ final class LiveHUD {
             if self.window == nil { self.build() }
             self.label?.stringValue = "Listening…"
             self.pendingText = nil
-            self.reposition()
+            self.currentHeight = self.minHeight
+            self.reposition(height: self.minHeight)
             self.window?.orderFrontRegardless()   // show WITHOUT taking focus
         }
     }
@@ -194,9 +202,9 @@ final class LiveHUD {
         }
     }
 
-    /// Main thread only. Sets the visible text and nothing else — no measuring
-    /// of the window, no resizing, so there is no synchronous relayout to stall
-    /// on. Once the text outgrows the panel we drop words from the front, which
+    /// Main thread only. Sets the visible text, then grows the panel to fit it —
+    /// resizing only when the height actually changed, and never with a
+    /// synchronous redraw. Past maxHeight the front is trimmed instead, which
     /// reads as the caption scrolling up.
     private func flush() {
         flushQueued = false
@@ -204,15 +212,14 @@ final class LiveHUD {
         pendingText = nil
 
         let t = raw.trimmingCharacters(in: .whitespacesAndNewlines)
-        if t.isEmpty { label.stringValue = "Listening…"; return }
+        var display = t.isEmpty ? "Listening…" : t
 
-        let fits = panelHeight - padY * 2
-        var display = t
+        let fits = maxHeight - padY * 2
         if heightFor(display) > fits {
             // Binary-search the longest suffix that still fits, so the newest
             // words — what's being spoken right now — stay visible.
-            var lo = 0, hi = display.count
             let chars = Array(display)
+            var lo = 0, hi = chars.count
             while lo < hi {
                 let mid = (lo + hi) / 2                     // drop `mid` chars
                 let candidate = "…" + String(chars[mid...])
@@ -222,6 +229,12 @@ final class LiveHUD {
                                         : "…" + String(chars[lo...])
         }
         label.stringValue = display
+
+        let h = min(max(heightFor(display) + padY * 2, minHeight), maxHeight)
+        if abs(h - currentHeight) > 0.5 {
+            currentHeight = h
+            reposition(height: h)
+        }
     }
 
     func hide() {
