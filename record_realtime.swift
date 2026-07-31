@@ -217,7 +217,7 @@ final class RealtimeSession {
     // speech_started/stopped events and pauses are inferred from gaps between
     // deltas instead.
     static let model = "gpt-live-transcribe"
-    static let lang  = "ru"
+    static let languages = ["ru", "en"]
 
     private let ws: URLSessionWebSocketTask
     private let lock = NSLock()
@@ -271,14 +271,18 @@ final class RealtimeSession {
                     "format": ["type": "audio/pcm", "rate": 24000],
                     "transcription": [
                         "model": Self.model,
-                        "language": Self.lang,
-                        // Deltas were arriving in slow bursts ("nothing, then a
-                        // lot at once"). `delay` trades latency for streaming
-                        // quality; "low" is what the docs recommend for live
-                        // captions. The text we actually paste comes from the
-                        // completed transcript, so a rougher live stream costs
-                        // us nothing.
-                        "delay": "low",
+                        // "languages" (plural array) is the documented field. The
+                        // singular "language" was silently ignored, leaving the
+                        // model to auto-detect — which is why a stray Chinese
+                        // character sometimes appeared at the start. Both ru and
+                        // en are listed because dictation mixes them ("localhost",
+                        // "restore").
+                        "languages": Self.languages,
+                        // Lowest latency, so words appear as they're spoken. Safe
+                        // because the text we paste comes from the completed
+                        // transcript, not this stream — a rougher live preview
+                        // costs us nothing.
+                        "delay": "minimal",
                     ],
                     // No turn_detection here: gpt-live-transcribe rejects it.
                 ]],
@@ -379,10 +383,12 @@ final class RealtimeSession {
             }
             lastActivity = Date()
             let (c, d) = (committedCount, completedCount)
-            let shown = transcript
             lock.unlock()
-            // Show the corrected version now that it's final.
-            LiveHUD.shared.update(shown)
+            // Deliberately does NOT refresh the HUD. `transcript` and `deltaText`
+            // accumulate independently, so showing the completed text here made
+            // the display jump backwards to a shorter, earlier state mid-speech
+            // (text appeared to freeze on a word, then leap forward). The HUD
+            // follows only the monotonically growing delta stream.
             log("utterance transcribed \(d)/\(c) (\(seg.count) chars)")
         case "conversation.item.input_audio_transcription.delta":
             // Deltas stream as speech arrives and are purely additive, so they
