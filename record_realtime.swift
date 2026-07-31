@@ -279,13 +279,17 @@ final class RealtimeSession {
     // speech_started/stopped bracket each utterance, and they arrive in order,
     // so a FIFO of "was this utterance preceded by a long pause?" lines up with
     // the transcription-completed events.
-    // NOTE: paragraph breaks are deliberately NOT inserted here. Timing-based
-    // detection was tried twice and both attempts were wrong: VAD speech events
-    // aren't available for this model, and gaps between delta arrivals measure
-    // the model's processing rhythm rather than the speaker's pauses, so even a
-    // brief hesitation produced a break. Paragraphing is now done by the
-    // translate step in dictate.py, which can see the whole text and split on
-    // meaning instead of milliseconds.
+    // Pause detection for the LIVE CAPTION ONLY. Earlier attempts failed because
+    // delta arrival tracked the model's processing rhythm rather than speech, but
+    // with delay="minimal" deltas now land as the words are spoken, so a gap
+    // between them does correspond to a real pause.
+    //
+    // This is deliberately cosmetic: it marks up `deltaText` (the HUD string),
+    // never `transcript` (what gets pasted). The pasted text is paragraphed by
+    // the translate step in dictate.py, which splits on meaning. So a mistuned
+    // threshold can only look wrong on screen — it cannot corrupt the output.
+    static let pauseBreakSeconds = 1.2
+    private var lastDeltaAt: Date? = nil
 
     init(key: String) {
         let url = URL(string: "wss://api.openai.com/v1/realtime?intent=transcription")!
@@ -433,10 +437,22 @@ final class RealtimeSession {
             let d = obj["delta"] as? String ?? ""
             if d.isEmpty { return }
             lock.lock()
-            deltaText += d
+            var gap = 0.0
+            if let last = lastDeltaAt { gap = -last.timeIntervalSinceNow }
+            let isBreak = lastDeltaAt != nil && gap >= Self.pauseBreakSeconds
+                          && !deltaText.isEmpty
+            if isBreak {
+                // Blank line for a new thought; drop the delta's leading space so
+                // the new paragraph isn't indented.
+                deltaText += "\n\n" + String(d.drop(while: { $0 == " " }))
+            } else {
+                deltaText += d
+            }
+            lastDeltaAt = Date()
             lastActivity = Date()
             let live = deltaText
             lock.unlock()
+            if isBreak { log(String(format: "caption: pause %.2fs → break", gap)) }
             LiveHUD.shared.update(live)
         case "error":
             // Server VAD usually commits every utterance on its own, so our
