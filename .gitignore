@@ -11,6 +11,7 @@ history_menubar.app/
 dialog_buttons
 hud
 paste_helper
+pcm_play
 
 # Stray duplicates
 *\ 2.py

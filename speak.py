@@ -42,6 +42,11 @@ AUDIO_EXT       = "wav"
 # Sentences after the first are grouped up to this size: once audio is playing
 # there's no latency pressure, and bigger chunks give the translator more context.
 CHUNK_TARGET_CHARS = 400
+# Streaming player for the first chunk: afplay needs a complete file, so it
+# can't start until the whole response has downloaded. pcm_play consumes raw PCM
+# on stdin and plays it as it arrives.
+PCM_PLAY         = os.path.join(SCRIPT_DIR, "pcm_play")
+PCM_SAMPLE_RATE  = 24000      # OpenAI TTS "pcm": 24kHz, 16-bit signed, mono, LE
 TTS_VOICE       = "nova"       # alloy / echo / fable / onyx / nova / shimmer
 
 TRANSLATE_PROMPT = (
@@ -196,6 +201,53 @@ def synthesize_to_file(text: str, api_key: str, output_path: str):
 
 # ── Sentence chunking ────────────────────────────────────────────────────────
 
+def stream_to_player(text: str, api_key: str) -> bool:
+    """Synthesize `text` and play it as the audio arrives, via pcm_play.
+
+    Used for the first chunk, where latency is all that matters: requesting raw
+    pcm and piping the chunked response straight into the player means sound
+    starts after the first few KB instead of after the whole file. Returns False
+    if the player isn't available, so the caller can fall back to afplay."""
+    if not os.path.exists(PCM_PLAY):
+        return False
+
+    payload = {
+        "model":           TTS_MODEL,
+        "voice":           TTS_VOICE,
+        "input":           text,
+        "response_format": "pcm",     # headerless; pcm_play adds no decode step
+    }
+    req = urllib.request.Request(
+        "https://api.openai.com/v1/audio/speech",
+        data=json.dumps(payload).encode(),
+        headers={
+            "Authorization": f"Bearer {api_key}",
+            "Content-Type":  "application/json",
+        },
+    )
+    proc = subprocess.Popen(
+        [PCM_PLAY, str(PCM_SAMPLE_RATE)],
+        stdin=subprocess.PIPE,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=60) as resp:
+            while True:
+                buf = resp.read(8192)
+                if not buf:
+                    break
+                proc.stdin.write(buf)
+                proc.stdin.flush()
+    finally:
+        try:
+            proc.stdin.close()
+        except Exception:
+            pass
+        proc.wait()          # returns when playback finishes
+    return True
+
+
 def group_sentences(sentences: list[str]) -> list[str]:
     """Batch sentences into chunks for the translate→TTS pipeline.
 
@@ -285,8 +337,11 @@ def main():
         chunk_q: queue.Queue[str | None] = queue.Queue(maxsize=4)
         stop = threading.Event()
 
+        # Chunks 1.. are pre-rendered to files in the background. This starts
+        # BEFORE the first chunk plays, so by the time chunk 0 finishes the next
+        # one is already waiting and there's no gap.
         def producer():
-            for i, source in enumerate(chunks):
+            for i, source in enumerate(chunks[1:], start=1):
                 if stop.is_set():
                     break
                 chunk_path = os.path.join(CHUNK_DIR, f"chunk_{i}.{AUDIO_EXT}")
@@ -307,15 +362,37 @@ def main():
 
         threading.Thread(target=producer, daemon=True).start()
 
-        # 3. Consumer (main thread): plays each chunk in order via afplay.
-        first = True
+        # 3. First chunk: stream it so sound starts after the first few KB rather
+        #    than after a whole file downloads. Runs on the main thread and blocks
+        #    until it has finished playing, while the producer above renders the
+        #    rest.
+        try:
+            if already_russian:
+                first_text = chunks[0]
+            else:
+                t0 = time.time()
+                first_text = translate_to_russian(chunks[0], api_key)
+                log(f"chunk 0 translate {time.time()-t0:.2f}s")
+            log(f"streaming chunk 0 ({len(first_text)} chars)")
+            if stream_to_player(first_text, api_key):
+                log(f"TIME TO FIRST AUDIO: ~{time.time()-started:.2f}s (streamed)")
+            else:
+                # No pcm_play binary — fall back to the download-then-play path.
+                path = os.path.join(CHUNK_DIR, f"chunk_0.{AUDIO_EXT}")
+                synthesize_to_file(first_text, api_key, path)
+                log(f"TIME TO FIRST AUDIO: {time.time()-started:.2f}s (buffered)")
+                subprocess.run(["/usr/bin/afplay", path], stdin=subprocess.DEVNULL,
+                               stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+                try: os.remove(path)
+                except Exception: pass
+        except Exception as e:
+            log(f"chunk 0 failed: {e}")
+
+        # 4. Remaining chunks: already rendered to files, play them in order.
         while True:
             chunk_path = chunk_q.get()
             if chunk_path is None:
                 break
-            if first:
-                log(f"TIME TO FIRST AUDIO: {time.time()-started:.2f}s")
-                first = False
             log(f"playing {os.path.basename(chunk_path)}")
             try:
                 subprocess.run(

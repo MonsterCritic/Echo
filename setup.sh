@@ -83,6 +83,9 @@ swiftc -O dialog_buttons.swift -o dialog_buttons
 # paste fast and load-immune. Ad-hoc sign so it can hold an Accessibility grant.
 swiftc -O paste_helper.swift -o paste_helper
 codesign -s - -f paste_helper 2>/dev/null || true
+# pcm_play streams raw PCM from stdin so AI Speak can start talking before the
+# whole TTS response has downloaded (afplay needs a complete file).
+swiftc -O pcm_play.swift -o pcm_play
 
 # ── 6. Make scripts executable ───────────────────────────────────────────────
 chmod +x rewrite_selection.sh rewrite.py dictate.py speak.py install.sh
