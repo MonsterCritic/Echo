@@ -572,11 +572,15 @@ def main():
         return
 
     t0 = time.monotonic()   # ≈ the moment the key was released
-    try:
-        rec_age = time.time() - os.path.getmtime(AUDIO_PATH)
-        log(f"released — recording finalized {rec_age:.2f}s ago (pre-warmed)")
-    except Exception:
-        pass
+    if REALTIME_MODE:
+        log("released — transcript streamed during hold (pre-warmed)")
+    else:
+        # Age of the just-written m4a ≈ how long ago the recording stopped.
+        try:
+            rec_age = time.time() - os.path.getmtime(AUDIO_PATH)
+            log(f"released — recording finalized {rec_age:.2f}s ago (pre-warmed)")
+        except Exception:
+            pass
 
     # Consume the ready flag so the next session starts clean.
     try: os.remove(READY_FLAG)
