@@ -470,14 +470,33 @@ def _finish_dictation(raw: str, clean: str, t0: float):
     threading.Thread(target=_delayed_restore, args=(saved, clean)).start()
 
 
-def read_realtime_transcript() -> str:
-    """Read the transcript the realtime recorder streamed during the hold."""
-    try:
-        with open(TRANSCRIPT_PATH) as f:
-            return f.read().strip()
-    except Exception as e:
-        log(f"transcript read failed: {e}")
-        return ""
+def read_realtime_transcript(timeout_s: float = 6.0) -> str:
+    """Read the transcript the realtime recorder streamed during the hold.
+
+    Waits briefly rather than giving up immediately. The recorder writes the
+    transcript before touching the ready flag, so it is normally already there —
+    but the flag is a shared file, and anything else that creates it (e.g. a
+    second recorder daemon left running) can wake us before the transcript
+    exists. Losing a dictation to that race is much worse than waiting."""
+    deadline = time.time() + timeout_s
+    warned = False
+    while time.time() < deadline:
+        try:
+            with open(TRANSCRIPT_PATH) as f:
+                text = f.read().strip()
+            if text:
+                return text
+        except FileNotFoundError:
+            pass
+        except Exception as e:
+            log(f"transcript read failed: {e}")
+            return ""
+        if not warned:
+            log("transcript not ready yet — waiting")
+            warned = True
+        time.sleep(0.05)
+    log(f"transcript still empty after {timeout_s:.0f}s")
+    return ""
 
 
 def process_dictation(t0: float):
