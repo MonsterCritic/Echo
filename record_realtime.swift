@@ -470,6 +470,85 @@ final class RealtimeSession {
     }
 }
 
+// ── Input device pinning ─────────────────────────────────────────────────────
+// Opening the mic on a Bluetooth headset forces macOS to switch it from A2DP
+// (high-quality output) to HFP/SCO (low-quality two-way), which costs ~1.5-2s
+// while the link renegotiates and audibly degrades whatever you're listening to.
+// Recording from a wired input instead avoids the switch completely, so the
+// headphones are never touched and there's no stall before capture starts.
+//
+// The device is chosen by name substring. Override without recompiling by
+// writing a name into ~/Library/Application Support/Echo/input_device; an empty
+// file or a device that isn't connected falls back to the system default.
+let inputDeviceFile = NSString(string: "~/Library/Application Support/Echo/input_device")
+                      .expandingTildeInPath
+let defaultPreferredInput = "Studio Display Microphone"
+
+func preferredInputName() -> String {
+    if let s = try? String(contentsOfFile: inputDeviceFile, encoding: .utf8) {
+        let name = s.trimmingCharacters(in: .whitespacesAndNewlines)
+        if !name.isEmpty { return name }
+    }
+    return defaultPreferredInput
+}
+
+/// Does this device actually have input channels? (Output-only devices share
+/// the same name as their input counterpart on some hardware.)
+func hasInputChannels(_ id: AudioDeviceID) -> Bool {
+    var addr = AudioObjectPropertyAddress(
+        mSelector: kAudioDevicePropertyStreamConfiguration,
+        mScope: kAudioDevicePropertyScopeInput,
+        mElement: kAudioObjectPropertyElementMain)
+    var size: UInt32 = 0
+    guard AudioObjectGetPropertyDataSize(id, &addr, 0, nil, &size) == noErr, size > 0 else { return false }
+    let raw = UnsafeMutableRawPointer.allocate(byteCount: Int(size), alignment: 16)
+    defer { raw.deallocate() }
+    guard AudioObjectGetPropertyData(id, &addr, 0, nil, &size, raw) == noErr else { return false }
+    let list = UnsafeMutableAudioBufferListPointer(raw.assumingMemoryBound(to: AudioBufferList.self))
+    return list.reduce(0) { $0 + Int($1.mNumberChannels) } > 0
+}
+
+func inputDevice(matching target: String) -> AudioDeviceID? {
+    var addr = AudioObjectPropertyAddress(
+        mSelector: kAudioHardwarePropertyDevices,
+        mScope: kAudioObjectPropertyScopeGlobal,
+        mElement: kAudioObjectPropertyElementMain)
+    var size: UInt32 = 0
+    guard AudioObjectGetPropertyDataSize(AudioObjectID(kAudioObjectSystemObject),
+                                         &addr, 0, nil, &size) == noErr else { return nil }
+    var ids = [AudioDeviceID](repeating: 0, count: Int(size) / MemoryLayout<AudioDeviceID>.size)
+    guard AudioObjectGetPropertyData(AudioObjectID(kAudioObjectSystemObject),
+                                     &addr, 0, nil, &size, &ids) == noErr else { return nil }
+    for id in ids where hasInputChannels(id) {
+        var nameAddr = AudioObjectPropertyAddress(
+            mSelector: kAudioObjectPropertyName,
+            mScope: kAudioObjectPropertyScopeGlobal,
+            mElement: kAudioObjectPropertyElementMain)
+        var cfName: CFString = "" as CFString
+        var sz = UInt32(MemoryLayout<CFString?>.size)
+        if AudioObjectGetPropertyData(id, &nameAddr, 0, nil, &sz, &cfName) == noErr {
+            if (cfName as String).localizedCaseInsensitiveContains(target) { return id }
+        }
+    }
+    return nil
+}
+
+/// Point the engine's input at the preferred device. Must run while the engine
+/// is stopped and before the input format is read.
+func pinInputDevice() {
+    let want = preferredInputName()
+    guard let unit = engine.inputNode.audioUnit else { return }
+    guard var devID = inputDevice(matching: want) else {
+        log("input '\(want)' not connected — using system default")
+        return
+    }
+    let st = AudioUnitSetProperty(unit,
+                                  kAudioOutputUnitProperty_CurrentDevice,
+                                  kAudioUnitScope_Global, 0,
+                                  &devID, UInt32(MemoryLayout<AudioDeviceID>.size))
+    log(st == noErr ? "input pinned to '\(want)'" : "could not pin input (OSStatus \(st))")
+}
+
 // ── Live PCM capture (AVAudioEngine → 24kHz Int16) ───────────────────────────
 let engine = AVAudioEngine()
 var converter: AVAudioConverter?
@@ -590,6 +669,12 @@ func stopRecording() {
 // and the WebSocket both drive their own queues, and a plain sleep-poll loop is
 // immune to whether AppKit is servicing the main run loop in this launch
 // context (a Timer silently never fired when launched outside launchd).
+// Pin the input device ONCE here, on the main thread, before recording begins.
+// Doing it inside startRecording (i.e. on the poll thread, while the engine was
+// spinning up) deadlocked in CoreAudio. The selection persists on the input
+// unit, so every later recording still uses it.
+pinInputDevice()
+
 let pollThread = Thread {
     log("poll thread running")
     var recording = false
