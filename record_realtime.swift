@@ -477,19 +477,22 @@ final class RealtimeSession {
 // Recording from a wired input instead avoids the switch completely, so the
 // headphones are never touched and there's no stall before capture starts.
 //
-// The device is chosen by name substring. Override without recompiling by
-// writing a name into ~/Library/Application Support/Echo/input_device; an empty
-// file or a device that isn't connected falls back to the system default.
+// Opt-in and machine-specific: hardware differs per user, so by default we pin
+// nothing and simply use whatever macOS has selected as the input. To pin a
+// device, write its name (or any distinctive part of it) into
+// ~/Library/Application Support/Echo/input_device. A name that matches nothing
+// currently connected also falls back to the system default, so unplugging the
+// device never breaks dictation.
+//
+// Run `record_realtime --list-inputs` to print the available input device names.
 let inputDeviceFile = NSString(string: "~/Library/Application Support/Echo/input_device")
                       .expandingTildeInPath
-let defaultPreferredInput = "Studio Display Microphone"
 
-func preferredInputName() -> String {
-    if let s = try? String(contentsOfFile: inputDeviceFile, encoding: .utf8) {
-        let name = s.trimmingCharacters(in: .whitespacesAndNewlines)
-        if !name.isEmpty { return name }
-    }
-    return defaultPreferredInput
+/// nil = use whatever macOS has selected.
+func preferredInputName() -> String? {
+    guard let s = try? String(contentsOfFile: inputDeviceFile, encoding: .utf8) else { return nil }
+    let name = s.trimmingCharacters(in: .whitespacesAndNewlines)
+    return name.isEmpty ? nil : name
 }
 
 /// Does this device actually have input channels? (Output-only devices share
@@ -533,10 +536,40 @@ func inputDevice(matching target: String) -> AudioDeviceID? {
     return nil
 }
 
-/// Point the engine's input at the preferred device. Must run while the engine
-/// is stopped and before the input format is read.
+/// Names of every device that can capture audio.
+func availableInputNames() -> [String] {
+    var addr = AudioObjectPropertyAddress(
+        mSelector: kAudioHardwarePropertyDevices,
+        mScope: kAudioObjectPropertyScopeGlobal,
+        mElement: kAudioObjectPropertyElementMain)
+    var size: UInt32 = 0
+    guard AudioObjectGetPropertyDataSize(AudioObjectID(kAudioObjectSystemObject),
+                                         &addr, 0, nil, &size) == noErr else { return [] }
+    var ids = [AudioDeviceID](repeating: 0, count: Int(size) / MemoryLayout<AudioDeviceID>.size)
+    guard AudioObjectGetPropertyData(AudioObjectID(kAudioObjectSystemObject),
+                                     &addr, 0, nil, &size, &ids) == noErr else { return [] }
+    var names: [String] = []
+    for id in ids where hasInputChannels(id) {
+        var nameAddr = AudioObjectPropertyAddress(
+            mSelector: kAudioObjectPropertyName,
+            mScope: kAudioObjectPropertyScopeGlobal,
+            mElement: kAudioObjectPropertyElementMain)
+        var cfName: CFString = "" as CFString
+        var sz = UInt32(MemoryLayout<CFString?>.size)
+        if AudioObjectGetPropertyData(id, &nameAddr, 0, nil, &sz, &cfName) == noErr {
+            names.append(cfName as String)
+        }
+    }
+    return names
+}
+
+/// Point the engine's input at the preferred device, if one is configured.
+/// Must run while the engine is stopped and before the input format is read.
 func pinInputDevice() {
-    let want = preferredInputName()
+    guard let want = preferredInputName() else {
+        log("no input device configured — using system default")
+        return
+    }
     guard let unit = engine.inputNode.audioUnit else { return }
     guard var devID = inputDevice(matching: want) else {
         log("input '\(want)' not connected — using system default")
@@ -669,11 +702,35 @@ func stopRecording() {
 // and the WebSocket both drive their own queues, and a plain sleep-poll loop is
 // immune to whether AppKit is servicing the main run loop in this launch
 // context (a Timer silently never fired when launched outside launchd).
-// Pin the input device ONCE here, on the main thread, before recording begins.
-// Doing it inside startRecording (i.e. on the poll thread, while the engine was
-// spinning up) deadlocked in CoreAudio. The selection persists on the input
-// unit, so every later recording still uses it.
-pinInputDevice()
+// `--list-inputs` prints the microphones this Mac can record from, then exits,
+// so you can copy an exact name into the input_device file. Placed here because
+// top-level globals in a Swift main file initialize in source order — running it
+// earlier touched inputDeviceFile before it existed and segfaulted.
+if CommandLine.arguments.contains("--list-inputs") {
+    print("Available audio input devices:\n")
+    for n in availableInputNames() { print("  \(n)") }
+    print("\nCurrently configured: \(preferredInputName() ?? "(none — using the system default)")")
+    print("\nTo pin one, write its name into:")
+    print("  \(inputDeviceFile)")
+    print("\nFor example:")
+    print("  mkdir -p \"$HOME/Library/Application Support/Echo\"")
+    print("  echo 'Your Device Name' > \"\(inputDeviceFile)\"")
+    exit(0)
+}
+
+// Pin the input device once, in the background.
+//
+// This is an optimisation, not a requirement, so it must never gate startup:
+// AudioUnitSetProperty(kAudioOutputUnitProperty_CurrentDevice) goes through the
+// CoreAudio HAL and has been observed to block indefinitely (stack sits in
+// HALC_ProxyObject::SetPropertyData) when the audio daemon is in a bad state.
+// On the main thread that hung the whole recorder — no logging, no hotkey
+// response. Off the main thread the daemon starts normally and simply records
+// from the system default if the pin never lands.
+//
+// It must also not run on the poll thread while the engine is starting, which
+// deadlocked in a different way, hence its own queue here.
+DispatchQueue.global(qos: .userInitiated).async { pinInputDevice() }
 
 let pollThread = Thread {
     log("poll thread running")

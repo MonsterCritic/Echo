@@ -105,6 +105,35 @@ These three steps cannot be scripted. macOS won't let any tool grant input-monit
    ```
    Add it to *System Settings → General → Login Items* if you want it auto-started.
 
+### Choosing which microphone to record from (optional)
+
+By default the recorder just uses whatever input macOS has selected, so there is
+nothing to configure.
+
+It's worth setting explicitly in one case: **if you wear Bluetooth headphones.**
+Opening a Bluetooth headset's microphone forces macOS to drop it from A2DP
+(stereo, high quality) to HFP/SCO (mono call mode). That switch adds roughly
+1.5–2 seconds before recording starts and audibly degrades whatever you're
+listening to. Pinning a *wired* input — a display mic, an audio interface, the
+built-in mic — avoids it: the headset is never opened, so it never switches.
+
+List the inputs available on your machine:
+
+```sh
+./record_realtime.app/Contents/MacOS/record_realtime --list-inputs
+```
+
+Then pin one by name (matching is case-insensitive and partial):
+
+```sh
+mkdir -p "$HOME/Library/Application Support/Echo"
+echo 'MacBook Pro Microphone' > "$HOME/Library/Application Support/Echo/input_device"
+```
+
+Restart the recorder to apply it. Delete the file to go back to the system
+default. If the named device isn't connected, the recorder logs that and falls
+back to the default, so unplugging it never breaks dictation.
+
 ### Verify
 
 | Tool | How to test | Expected |
