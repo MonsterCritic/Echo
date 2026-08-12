@@ -2,6 +2,13 @@
 
 A small set of macOS tools wired up to the Globe (🌐 / Fn) key. All actions run locally on your Mac; only the OpenAI API is called over the network.
 
+> **macOS only.** This is not cross-platform and isn't intended to be — it's built
+> on Swift/AVFoundation, CoreAudio, AppKit, Automator Quick Actions, `afplay`, and
+> Karabiner-Elements. There is no Windows or Linux equivalent of these pieces, so
+> porting would mean rewriting nearly all of it. Requires an
+> [OpenAI API key](https://platform.openai.com/api-keys) (usage is billed to you —
+> dictation costs roughly a quarter of a cent per long message).
+
 ---
 
 ## Features
