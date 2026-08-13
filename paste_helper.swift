@@ -9,7 +9,8 @@
 // Usage:
 //   paste_helper [target-app-name]   focus target if needed, then Cmd+V
 //   paste_helper --copy              send Cmd+C to the current frontmost app
-//   paste_helper --check             only trigger/verify the Accessibility grant
+//   paste_helper --check             report Accessibility status, never prompts
+//   paste_helper --grant             report status AND raise the system prompt
 //
 // Prints the app that was frontmost before the keystroke (for the caller's log).
 // If Accessibility isn't granted yet it writes ACCESSIBILITY_NOT_GRANTED to
@@ -21,18 +22,32 @@ import CoreGraphics
 
 let args = CommandLine.arguments
 let checkOnly = args.contains("--check")
+let grantMode = args.contains("--grant")
 let copyMode  = args.contains("--copy")
 let target = (args.count > 1 && !args[1].hasPrefix("--")) ? args[1] : ""
 
 let ws = NSWorkspace.shared
 let frontBefore = ws.frontmostApplication?.localizedName ?? ""
 
-// Accessibility is required to post key events. Prompt on first run; once
-// granted the prompt never reappears.
-let promptKey = kAXTrustedCheckOptionPrompt.takeUnretainedValue() as String
-let trusted = AXIsProcessTrustedWithOptions([promptKey: true] as CFDictionary)
+// Accessibility is required to post key events.
+//
+// Only --grant may raise the system prompt. Everything else checks silently,
+// because macOS attributes Accessibility to the RESPONSIBLE process, not to this
+// binary: when AI Rewrite runs us from its Automator Quick Action, the
+// responsible process is WorkflowServiceRunner.xpc. Prompting there produced a
+// recurring "WorkflowServiceRunner.xpc would like to control this Mac" dialog
+// naming a system XPC service the user cannot usefully grant — while the paste
+// itself still succeeded via the caller's osascript fallback. So: never prompt
+// on the normal path, just report untrusted and let the caller fall back.
+let trusted: Bool = {
+    if grantMode {
+        let promptKey = kAXTrustedCheckOptionPrompt.takeUnretainedValue() as String
+        return AXIsProcessTrustedWithOptions([promptKey: true] as CFDictionary)
+    }
+    return AXIsProcessTrusted()
+}()
 
-if checkOnly {
+if checkOnly || grantMode {
     print(trusted ? "TRUSTED" : "NOT_TRUSTED")
     exit(trusted ? 0 : 2)
 }
