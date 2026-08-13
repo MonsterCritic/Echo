@@ -563,9 +563,23 @@ func availableInputNames() -> [String] {
     return names
 }
 
+// Signalled once the pin attempt has finished (successfully or not). Recording
+// waits on this: changing the input device while the engine is being configured
+// invalidates its format, which showed up as a -10868 FormatNotSupported and a
+// tap that delivered 0 bytes — the HUD appeared but nothing was ever heard.
+let pinSettled = DispatchSemaphore(value: 0)
+var pinSignalled = false
+let pinLock = NSLock()
+
+func signalPinSettled() {
+    pinLock.lock(); defer { pinLock.unlock() }
+    if !pinSignalled { pinSignalled = true; pinSettled.signal() }
+}
+
 /// Point the engine's input at the preferred device, if one is configured.
 /// Must run while the engine is stopped and before the input format is read.
 func pinInputDevice() {
+    defer { signalPinSettled() }
     guard let want = preferredInputName() else {
         log("no input device configured — using system default")
         return
@@ -626,6 +640,15 @@ func startRecording() {
     let s = RealtimeSession(key: apiKey)
     s.start()
     session = s
+
+    // Don't read the input format until the device pin has settled — doing so
+    // mid-pin picked up a stale format and the tap then produced no audio at all.
+    // Bounded, so a slow/hung CoreAudio call costs one recording's device
+    // preference rather than the recording itself.
+    if pinSettled.wait(timeout: .now() + 3.0) == .timedOut {
+        log("input pin still pending — recording from the current device")
+    }
+    pinSettled.signal()   // keep it available for later recordings
 
     let input = engine.inputNode
     let inFormat = input.outputFormat(forBus: 0)
