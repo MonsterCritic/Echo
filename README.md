@@ -61,6 +61,15 @@ A small menubar app (`history_menubar.app`) shows the last few dictation results
 - Enable the imported rule inside the Karabiner-Elements app.
 - Click through the macOS permission prompts (Microphone, Accessibility, Automation).
 
+It **should**, without being asked:
+
+- Run `--list-inputs`, then **offer to pin one microphone as the default** (see
+  [Choosing which microphone to record from](#choosing-which-microphone-to-record-from)).
+  Recommend this Mac's own built-in input — "MacBook Pro Microphone", or a wired
+  display/interface mic — and **never** a pair of Bluetooth headphones, for the
+  reason below. Show the detected options and let the user pick; don't guess
+  silently.
+
 Hand the README to Claude Code and the automated half completes in seconds; the manual half takes about two minutes.
 
 ### Prereqs (one-time, manual)
@@ -112,17 +121,23 @@ These three steps cannot be scripted. macOS won't let any tool grant input-monit
    ```
    Add it to *System Settings → General → Login Items* if you want it auto-started.
 
-### Choosing which microphone to record from (optional)
+### Choosing which microphone to record from
 
-By default the recorder just uses whatever input macOS has selected, so there is
-nothing to configure.
+Worth doing once, and **recommended**: pin a single input instead of following
+whatever macOS has currently selected. If you skip it the recorder still works —
+it just uses the system default, and follows it as it changes.
 
-It's worth setting explicitly in one case: **if you wear Bluetooth headphones.**
+**Pin your Mac's own built-in input** — "MacBook Pro Microphone", a Studio
+Display mic, or a wired audio interface. **Don't pin Bluetooth headphones.**
 Opening a Bluetooth headset's microphone forces macOS to drop it from A2DP
 (stereo, high quality) to HFP/SCO (mono call mode). That switch adds roughly
 1.5–2 seconds before recording starts and audibly degrades whatever you're
-listening to. Pinning a *wired* input — a display mic, an audio interface, the
-built-in mic — avoids it: the headset is never opened, so it never switches.
+listening to. A wired input avoids it: the headset is never opened, so it never
+switches — and the pin means plugging in headphones later can't drag dictation
+onto them.
+
+> Installing with Claude Code? Ask it to set this up — it can list your inputs
+> and write the config file for you. It should suggest your built-in mic.
 
 List the inputs available on your machine:
 
