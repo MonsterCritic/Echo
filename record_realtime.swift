@@ -288,7 +288,14 @@ final class RealtimeSession {
     // never `transcript` (what gets pasted). The pasted text is paragraphed by
     // the translate step in dictate.py, which splits on meaning. So a mistuned
     // threshold can only look wrong on screen — it cannot corrupt the output.
-    static let pauseBreakSeconds = 1.2
+    //
+    // Threshold picked from 125 logged breaks rather than by feel. Their gaps
+    // form a dense cluster from 1.0–2.25s (78% of them) and then collapse to a
+    // thin tail — two populations: ordinary between-phrase timing, and pauses the
+    // speaker actually meant. 1.2s sliced through the middle of the first one, so
+    // the caption broke mid-sentence while dictating normally. 2.5s sits in the
+    // gap between them and keeps the 18% that look deliberate.
+    static let pauseBreakSeconds = 2.5
     private var lastDeltaAt: Date? = nil
 
     init(key: String) {
