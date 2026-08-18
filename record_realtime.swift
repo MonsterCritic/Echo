@@ -635,7 +635,14 @@ func startRecording() {
     try? FileManager.default.removeItem(atPath: readyFlag)
     try? FileManager.default.removeItem(atPath: transcriptPath)
 
-    LiveHUD.shared.show()
+    // The HUD is deliberately NOT shown here. It used to appear the moment the
+    // key went down, but everything below still has to happen first — the
+    // WebSocket connect, the device-pin wait, and the CoreAudio device open — so
+    // the caption sat on screen while the microphone was still closed. It read as
+    // "go ahead, speak", and the first few words were spoken into a mic that
+    // wasn't open yet. It now appears from the audio tap on the first buffer that
+    // actually reaches us, so the HUD being visible means we really are listening.
+    let pressedAt = Date()
 
     let s = RealtimeSession(key: apiKey)
     s.start()
@@ -654,17 +661,30 @@ func startRecording() {
     let inFormat = input.outputFormat(forBus: 0)
     converter = AVAudioConverter(from: inFormat, to: targetFormat)
     var loggedFirst = false
+    var hudShown = false
     input.installTap(onBus: 0, bufferSize: 2048, format: inFormat) { buffer, _ in
         guard let pcm = convertToPCM16(buffer), !pcm.isEmpty else {
             if !loggedFirst { loggedFirst = true; log("tap: got buffer frames=\(buffer.frameLength) but conversion produced nothing") }
             return
         }
-        if !loggedFirst { loggedFirst = true; log("tap: first audio ok — \(buffer.frameLength) frames in → \(pcm.count) bytes out") }
+        if !loggedFirst {
+            loggedFirst = true
+            let ms = Int(Date().timeIntervalSince(pressedAt) * 1000)
+            log("tap: first audio ok — \(buffer.frameLength) frames in → \(pcm.count) bytes out (\(ms)ms after press)")
+        }
+        // Tied to a converted, non-empty buffer rather than to `loggedFirst`,
+        // which the failure branch above also sets — the caption must only ever
+        // promise what the mic is actually delivering.
+        if !hudShown { hudShown = true; LiveHUD.shared.show() }
         session?.sendAudio(pcm)
         stateLock.lock(); sentBytes += pcm.count; stateLock.unlock()
     }
     engine.prepare()
-    do { try engine.start(); log("recording started (in: \(inFormat.sampleRate)Hz)") }
+    do {
+        try engine.start()
+        let ms = Int(Date().timeIntervalSince(pressedAt) * 1000)
+        log("recording started (in: \(inFormat.sampleRate)Hz, \(ms)ms after press)")
+    }
     catch { log("engine start failed: \(error)") }
 }
 
