@@ -594,6 +594,19 @@ func availableInputNames() -> [String] {
 // waits on this: changing the input device while the engine is being configured
 // invalidates its format, which showed up as a -10868 FormatNotSupported and a
 // tap that delivered 0 bytes — the HUD appeared but nothing was ever heard.
+// Self-healing. Every way this recorder has broken looks the same from outside:
+// the process is alive and responsive, the flags still work, and every recording
+// captures zero bytes — a wedged CoreAudio graph, a device that vanished, an
+// engine that refused to start. None of it recovers in-process; all of it is
+// cured by a fresh process, which launchd will hand us for free on exit.
+//
+// So count consecutive silent recordings and exit once it is clearly not a
+// one-off, rather than staying up and quietly dropping every dictation until
+// someone notices and restarts by hand.
+var deadCaptures = 0
+let deadCaptureLimit = 2
+var recordingStartedAt = Date()
+
 let pinSettled = DispatchSemaphore(value: 0)
 var pinSignalled = false
 let pinLock = NSLock()
@@ -603,50 +616,28 @@ func signalPinSettled() {
     if !pinSignalled { pinSignalled = true; pinSettled.signal() }
 }
 
-/// Point the engine's input at the preferred device, if one is configured.
-/// Must run while the engine is stopped and before the input format is read.
+/// Input-device selection is NOT done here any more.
+///
+/// This used to set kAudioOutputUnitProperty_CurrentDevice on the engine's input
+/// unit. Doing so leaves the graph unable to start at all: engine.start() then
+/// fails with -10868 FormatNotSupported for every device tried, captures nothing,
+/// and does not recover in-process — pointing the unit back at the system default
+/// and resetting the engine fails identically. The practical effect was that
+/// choosing a microphone silently ended dictation, with no caption and no audio,
+/// until the recorder was restarted without a pin.
+///
+/// The menubar's Microphone picker moves the macOS default input instead, which
+/// is the configuration this recorder already runs correctly on. So there is
+/// nothing to override here; we only warn about a leftover config file, because
+/// applying it is what used to break capture.
 func pinInputDevice() {
     defer { signalPinSettled() }
     guard let want = preferredInputName() else {
-        log("no input device configured — using system default")
+        log("using the system default input")
         return
     }
-    guard let unit = engine.inputNode.audioUnit else { return }
-    guard var devID = inputDevice(matching: want) else {
-        log("input '\(want)' not connected — using system default")
-        return
-    }
-    let st = AudioUnitSetProperty(unit,
-                                  kAudioOutputUnitProperty_CurrentDevice,
-                                  kAudioUnitScope_Global, 0,
-                                  &devID, UInt32(MemoryLayout<AudioDeviceID>.size))
-    log(st == noErr ? "input pinned to '\(want)'" : "could not pin input (OSStatus \(st))")
-
-    // Read back what the unit is on now. noErr above does NOT prove the engine
-    // honored the request, and on hardware where every input shares a sample rate
-    // the "in: NHz" line can't tell the devices apart — so a read-back is the only
-    // trustworthy answer to "which mic is this actually recording from?".
-    var actual = ""
-    if let id = currentInputDevice(unit), let name = deviceName(id) {
-        actual = name
-        if !name.localizedCaseInsensitiveContains(want) {
-            log("WARNING: pin reported success but the unit is on '\(name)'")
-        } else {
-            log("input device in use: '\(name)'")
-        }
-    } else {
-        log("could not read back the input device in use")
-    }
-    try? actual.write(toFile: actualInputFile, atomically: true, encoding: .utf8)
-}
-
-/// Which device the engine's input unit is on right now.
-func currentInputDevice(_ unit: AudioUnit) -> AudioDeviceID? {
-    var devID = AudioDeviceID(0)
-    var sz = UInt32(MemoryLayout<AudioDeviceID>.size)
-    guard AudioUnitGetProperty(unit, kAudioOutputUnitProperty_CurrentDevice,
-                               kAudioUnitScope_Global, 0, &devID, &sz) == noErr else { return nil }
-    return devID
+    log("ignoring stale pin '\(want)' — pinning broke capture and is no longer applied")
+    log("delete \(inputDeviceFile) to silence this")
 }
 
 // ── Live PCM capture (AVAudioEngine → 24kHz Int16) ───────────────────────────
@@ -696,6 +687,7 @@ func startRecording() {
     // wasn't open yet. It now appears from the audio tap on the first buffer that
     // actually reaches us, so the HUD being visible means we really are listening.
     let pressedAt = Date()
+    recordingStartedAt = pressedAt
 
     let s = RealtimeSession(key: apiKey)
     s.start()
@@ -801,8 +793,23 @@ func stopRecording() {
         try? "".write(toFile: transcriptPath, atomically: true, encoding: .utf8)
         FileManager.default.createFile(atPath: readyFlag, contents: Data())
         s.close(); session = nil
+
+        // Nothing at all, from a hold long enough that there should have been
+        // something. A brief tap is not evidence of anything, so it doesn't count.
+        let held = -recordingStartedAt.timeIntervalSinceNow
+        if bytes == 0 && held >= 1.0 {
+            deadCaptures += 1
+            log("captured nothing after \(String(format: "%.1f", held))s (\(deadCaptures)/\(deadCaptureLimit))")
+            if deadCaptures >= deadCaptureLimit {
+                // The handoff above already completed, so dictate.py is not left
+                // waiting on a process that is about to disappear.
+                log("audio is not working — exiting so launchd starts a clean recorder")
+                exit(1)
+            }
+        }
         return
     }
+    deadCaptures = 0
     s.commit()
 
     // Wait for EVERY committed utterance to come back transcribed before handing

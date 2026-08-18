@@ -86,6 +86,7 @@ func deviceProperty<T>(_ id: AudioDeviceID, _ selector: AudioObjectPropertySelec
 }
 
 struct InputDevice {
+    let id: AudioDeviceID
     let name: String
     let transport: UInt32
 
@@ -111,9 +112,44 @@ func inputDevices() -> [InputDevice] {
     for id in ids where hasInputChannels(id) {
         guard let cf: CFString = deviceProperty(id, kAudioObjectPropertyName, "" as CFString) else { continue }
         let transport = deviceProperty(id, kAudioDevicePropertyTransportType, UInt32(0)) ?? 0
-        out.append(InputDevice(name: cf as String, transport: transport))
+        out.append(InputDevice(id: id, name: cf as String, transport: transport))
     }
     return out
+}
+
+/// The system default input device's id.
+func defaultInputDeviceID() -> AudioDeviceID? {
+    var addr = AudioObjectPropertyAddress(
+        mSelector: kAudioHardwarePropertyDefaultInputDevice,
+        mScope: kAudioObjectPropertyScopeGlobal,
+        mElement: kAudioObjectPropertyElementMain)
+    var id = AudioDeviceID(0)
+    var sz = UInt32(MemoryLayout<AudioDeviceID>.size)
+    guard AudioObjectGetPropertyData(AudioObjectID(kAudioObjectSystemObject),
+                                     &addr, 0, nil, &sz, &id) == noErr else { return nil }
+    return id
+}
+
+/// Point macOS at a different input device — the same setting as
+/// System Settings → Sound → Input.
+///
+/// This is how the picker works, rather than overriding the device on the
+/// recorder's own audio engine. That override was the original design and it
+/// could not be made to work: setting kAudioOutputUnitProperty_CurrentDevice on
+/// the engine's input unit leaves the graph unable to start at all (-10868 for
+/// every device tried), so choosing a microphone silently ended dictation until
+/// the recorder was restarted without it. Moving the system default has no such
+/// problem, because "follow the system default" is the configuration the
+/// recorder already runs correctly on.
+func setDefaultInputDevice(_ id: AudioDeviceID) -> Bool {
+    var addr = AudioObjectPropertyAddress(
+        mSelector: kAudioHardwarePropertyDefaultInputDevice,
+        mScope: kAudioObjectPropertyScopeGlobal,
+        mElement: kAudioObjectPropertyElementMain)
+    var dev = id
+    return AudioObjectSetPropertyData(AudioObjectID(kAudioObjectSystemObject),
+                                      &addr, 0, nil,
+                                      UInt32(MemoryLayout<AudioDeviceID>.size), &dev) == noErr
 }
 
 /// The system default input's name. Used when nothing is pinned, so the menu can
@@ -238,50 +274,33 @@ class StatusController: NSObject, NSMenuDelegate {
         menu.addItem(NSMenuItem.separator())
 
         // ── Microphone ───────────────────────────────────────────────────────
-        // Titled with the device actually in use, so the truth is visible without
+        // Titled with the live input, so the current mic is readable without
         // opening the submenu.
-        let devices = inputDevices()
-        let chosen  = chosenInputName()
-        // With a pin, only the daemon's read-back can say whether it stuck. Without
-        // one, the answer is just the system default, which we can resolve here.
-        let inUse   = (chosen == nil) ? defaultInputName() : actualInputName()
+        let devices  = inputDevices()
+        let currentID = defaultInputDeviceID()
+        let inUse = devices.first { $0.id == currentID }?.name
 
-        let micRoot = NSMenuItem(title: "Microphone: \(inUse ?? chosen ?? "System Default")",
+        let micRoot = NSMenuItem(title: "Microphone: \(inUse ?? "unknown")",
                                  action: nil, keyEquivalent: "")
         let micMenu = NSMenu()
-
-        let defaultItem = NSMenuItem(title: "System Default",
-                                     action: #selector(pickInput(_:)), keyEquivalent: "")
-        defaultItem.target = self
-        defaultItem.representedObject = nil        // nil = remove the pin
-        defaultItem.state = (chosen == nil) ? .on : .off
-        defaultItem.toolTip = inUse.map { "Follow whatever input macOS has selected (now \($0))." }
-                              ?? "Follow whatever input macOS has selected."
-        micMenu.addItem(defaultItem)
-        micMenu.addItem(NSMenuItem.separator())
 
         for dev in devices {
             let item = NSMenuItem(title: dev.isBluetooth ? "\(dev.name)  · Bluetooth" : dev.name,
                                   action: #selector(pickInput(_:)), keyEquivalent: "")
             item.target = self
-            item.representedObject = dev.name
-            item.state = (chosen.map { nameMatches($0, dev.name) } ?? false) ? .on : .off
-            if dev.isBluetooth {
-                item.toolTip = "Opening a Bluetooth mic drops the headset to mono call "
-                             + "mode: it delays the start of recording and degrades "
-                             + "whatever you're listening to."
-            }
+            item.representedObject = NSNumber(value: dev.id)
+            item.state = (dev.id == currentID) ? .on : .off
+            item.toolTip = dev.isBluetooth
+                ? "Opening a Bluetooth mic drops the headset to mono call mode: it "
+                + "delays the start of recording and degrades whatever you're listening to."
+                : "Record from this input."
             micMenu.addItem(item)
         }
 
-        // A pin can fail silently — surface the disagreement instead of hiding it.
-        if let chosen = chosen, let inUse = inUse, !nameMatches(chosen, inUse) {
-            micMenu.addItem(NSMenuItem.separator())
-            let warn = NSMenuItem(title: "⚠︎ pinned to \(chosen) — recording from \(inUse)",
-                                  action: nil, keyEquivalent: "")
-            warn.isEnabled = false
-            micMenu.addItem(warn)
-        }
+        micMenu.addItem(NSMenuItem.separator())
+        let note = NSMenuItem(title: "Sets the macOS input device", action: nil, keyEquivalent: "")
+        note.isEnabled = false
+        micMenu.addItem(note)
 
         micRoot.submenu = micMenu
         menu.addItem(micRoot)
@@ -398,20 +417,16 @@ class StatusController: NSObject, NSMenuDelegate {
                 byReference: true)?.play()
     }
 
-    /// nil representedObject = "System Default", i.e. remove the pin entirely.
+    /// Switch the microphone by moving the macOS default input, then restart the
+    /// recorder so its engine is built against the new device — it reads the
+    /// input once at startup, and a running engine does not survive the change.
     @objc func pickInput(_ sender: NSMenuItem) {
-        let fm = FileManager.default
-        if let name = sender.representedObject as? String {
-            let dir = (inputDeviceFile as NSString).deletingLastPathComponent
-            try? fm.createDirectory(atPath: dir, withIntermediateDirectories: true)
-            try? (name + "\n").write(toFile: inputDeviceFile, atomically: true, encoding: .utf8)
-        } else {
-            try? fm.removeItem(atPath: inputDeviceFile)
-        }
-        // Drop the published read-back too: it describes the device the daemon was
-        // on before this change, and showing it as current would be a lie until
-        // the restarted daemon republishes.
-        try? fm.removeItem(atPath: actualInputFile)
+        guard let boxed = sender.representedObject as? NSNumber else { return }
+        guard setDefaultInputDevice(AudioDeviceID(boxed.uint32Value)) else { return }
+        // Any leftover pin would poison the engine on the next start; the picker
+        // no longer writes one, but an older install may have left one behind.
+        try? FileManager.default.removeItem(atPath: inputDeviceFile)
+        try? FileManager.default.removeItem(atPath: actualInputFile)
         restartRecorder()
     }
 

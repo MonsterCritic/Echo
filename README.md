@@ -155,15 +155,18 @@ onto them.
 > Installing with Claude Code? Ask it to set this up — it can list your inputs
 > and write the config file for you. It should suggest your built-in mic.
 
-**The easy way is the menubar icon → Microphone.** It lists every input, marks
-Bluetooth ones, checkmarks the one you've pinned, and titles itself with the mic
-actually in use. Picking an entry writes the config and restarts the recorder for
-you; **System Default** removes the pin.
+**Use the menubar icon → Microphone.** It lists every input, marks Bluetooth
+ones, and checkmarks the one in use. Picking an entry **changes the macOS input
+device** — the same setting as System Settings → Sound → Input — and restarts the
+recorder so it picks the change up.
 
-That menu also surfaces a failure the config file can't: pinning is a request, and
-`AudioUnitSetProperty` can return success without the engine honoring it. The
-recorder reads the device back after pinning and publishes what it really got, so
-if the two disagree the menu says so outright — `⚠︎ pinned to X — recording from Y`.
+It works that way for a reason. Overriding the device on the recorder's own audio
+engine (`kAudioOutputUnitProperty_CurrentDevice`) is the obvious approach and it
+cannot be made to work: the engine then fails to start at all with `-10868
+FormatNotSupported`, for every device, and does not recover in-process. Choosing a
+microphone silently ended dictation until the recorder was restarted without it.
+Moving the system default has no such problem, because "follow the system default"
+is what the recorder already runs on.
 
 From a shell, list the inputs with:
 
@@ -171,23 +174,21 @@ From a shell, list the inputs with:
 "$HOME/Library/Application Support/Echo/bin/record_realtime.app/Contents/MacOS/record_realtime" --list-inputs
 ```
 
-Then pin one by name (matching is case-insensitive and partial):
+One thing worth measuring on your own hardware: mics differ in how fast they
+open, and that delay sits between your keypress and the caption appearing. Here a
+Studio Display mic took ~570ms to first audio while EarPods took ~260ms. A
+far-field display mic also recognises noticeably worse than a close-talking
+headset, so the convenient mic is not always the better one.
 
-```sh
-mkdir -p "$HOME/Library/Application Support/Echo"
-echo 'MacBook Pro Microphone' > "$HOME/Library/Application Support/Echo/input_device"
-launchctl kickstart -k "gui/$(id -u)/com.echo.context-helper.record-realtime"
-```
+### If dictation stops working
 
-The recorder reads the pin once at startup, hence the restart. Delete the file to
-go back to the system default. If the named device isn't connected, the recorder
-logs that and falls back to the default, so unplugging it never breaks dictation.
+It shouldn't need a manual fix. The recorder watches its own captures: two
+consecutive holds that record nothing mean the audio graph is wedged — which
+never recovers in-process — so it exits and launchd starts a clean one, ready by
+the next time you press Globe. A single silent recording is ignored, since one is
+not evidence of anything.
 
-One trade-off worth measuring on your own hardware: pinning can cost latency. On
-a Studio Display mic the engine took ~450ms to open versus ~35ms for the default,
-pushing the caption from ~140ms to ~555ms after the keypress. A far-field display
-mic also recognises noticeably worse than a close-talking headset. Pin for
-predictability, not because it's automatically better.
+`/tmp/record_realtime.log` records every such decision.
 
 ### Verify
 
