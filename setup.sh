@@ -33,8 +33,50 @@ if [ ! -f .env ]; then
     fi
 fi
 
-# ── 3. Build record.app ──────────────────────────────────────────────────────
-echo "Building record.app…"
+# ── 3. Build record_realtime.app ─────────────────────────────────────────────
+# This is the recorder AI Dictate actually uses. It streams mic audio to the
+# OpenAI realtime endpoint during the hold, so the transcript is ready almost as
+# soon as you let go, and it draws the live caption while you speak.
+echo "Building record_realtime.app…"
+mkdir -p record_realtime.app/Contents/MacOS
+cat > record_realtime.app/Contents/Info.plist <<'PLIST'
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>CFBundleIdentifier</key><string>com.echo.context-helper.record-realtime</string>
+    <key>CFBundleExecutable</key><string>record_realtime</string>
+    <key>CFBundleName</key><string>Echo Realtime Recorder</string>
+    <key>CFBundlePackageType</key><string>APPL</string>
+    <key>CFBundleShortVersionString</key><string>1.0</string>
+    <key>CFBundleVersion</key><string>1</string>
+    <key>LSUIElement</key><true/>
+    <key>NSMicrophoneUsageDescription</key><string>Streaming your voice for realtime AI dictation.</string>
+    <key>NSAppSleepDisabled</key><true/>
+</dict>
+</plist>
+PLIST
+swiftc -O -module-name record_realtime record_realtime.swift \
+    -o record_realtime.app/Contents/MacOS/record_realtime
+# Sign it, but clear two things first or the signature won't verify:
+#   • a stale _CodeSignature, whose CodeResources still claims resources the
+#     rebuilt bundle no longer has ("code has no resources but signature
+#     indicates they must be present");
+#   • com.apple.FinderInfo, which iCloud-synced folders stamp onto directories
+#     and codesign rejects outright as "detritus".
+# An unverifiable bundle still runs under a direct-exec LaunchAgent, but macOS
+# refuses to `open` it (LaunchServices -10825), which is a confusing way to fail.
+rm -rf record_realtime.app/Contents/_CodeSignature
+xattr -d com.apple.FinderInfo record_realtime.app 2>/dev/null || true
+xattr -cr record_realtime.app 2>/dev/null || true
+codesign -s - -f record_realtime.app 2>/dev/null || true
+
+# ── 3b. Build record.app ─────────────────────────────────────────────────────
+# The legacy recorder: writes an m4a, which dictate.py then uploads. Superseded
+# by record_realtime.app above and NOT auto-started, but still built so the old
+# path stays one step away — set REALTIME_MODE = False in dictate.py and load
+# this bundle's LaunchAgent instead.
+echo "Building record.app (legacy m4a recorder, kept for revert)…"
 mkdir -p record.app/Contents/MacOS
 cat > record.app/Contents/Info.plist <<'PLIST'
 <?xml version="1.0" encoding="UTF-8"?>
@@ -94,24 +136,37 @@ chmod +x rewrite_selection.sh rewrite.py dictate.py speak.py install.sh
 echo "Installing AI Rewrite Quick Action…"
 ./install.sh < /dev/null
 
-# ── 8. LaunchAgent for the recorder daemon ───────────────────────────────────
-echo "Installing LaunchAgent (auto-starts the recorder at login)…"
+# ── 8. LaunchAgent for the realtime recorder daemon ──────────────────────────
+echo "Installing LaunchAgent (auto-starts the realtime recorder at login)…"
 mkdir -p "$HOME/Library/LaunchAgents"
-PLIST_PATH="$HOME/Library/LaunchAgents/com.echo.context-helper.record.plist"
+
+# Retire the legacy recorder's agent if an earlier install left it loaded. Both
+# daemons poll the same /tmp flags, and the legacy one creates the ready flag as
+# soon as it stops recording — so dictate.py hands off before the realtime
+# transcript exists and the dictation is silently lost. Exactly one may be loaded.
+OLD_PLIST="$HOME/Library/LaunchAgents/com.echo.context-helper.record.plist"
+if [ -f "$OLD_PLIST" ]; then
+    launchctl unload "$OLD_PLIST" 2>/dev/null || true
+    mv -f "$OLD_PLIST" "$OLD_PLIST.disabled"
+    echo "  retired the legacy recorder agent (renamed to .disabled)"
+fi
+
+PLIST_PATH="$HOME/Library/LaunchAgents/com.echo.context-helper.record-realtime.plist"
 cat > "$PLIST_PATH" <<EOF
 <?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0">
 <dict>
-    <key>Label</key><string>com.echo.context-helper.record</string>
+    <key>Label</key><string>com.echo.context-helper.record-realtime</string>
     <key>ProgramArguments</key>
     <array>
-        <string>$SCRIPT_DIR/record.app/Contents/MacOS/record</string>
+        <string>$SCRIPT_DIR/record_realtime.app/Contents/MacOS/record_realtime</string>
     </array>
     <key>RunAtLoad</key><true/>
     <key>KeepAlive</key><true/>
-    <key>StandardOutPath</key><string>/tmp/record.out.log</string>
-    <key>StandardErrorPath</key><string>/tmp/record.err.log</string>
+    <key>ProcessType</key><string>Interactive</string>
+    <key>StandardOutPath</key><string>/tmp/record_realtime.out.log</string>
+    <key>StandardErrorPath</key><string>/tmp/record_realtime.err.log</string>
 </dict>
 </plist>
 EOF
@@ -178,11 +233,29 @@ THESE THREE STEPS REQUIRE GUI CLICKS — they cannot be scripted:
    • Automation        (allow your shell to control "System Events")
    Approve all of them.
 
+RECOMMENDED — pin one microphone, so dictation always records from the
+same input instead of following whatever macOS has selected. See which
+inputs this Mac has:
+
+   ./record_realtime.app/Contents/MacOS/record_realtime --list-inputs
+
+Then write the one you want into the config and restart the recorder:
+
+   mkdir -p "$HOME/Library/Application Support/Echo"
+   echo 'MacBook Pro Microphone' > "$HOME/Library/Application Support/Echo/input_device"
+   launchctl kickstart -k "gui/$(id -u)/com.echo.context-helper.record-realtime"
+
+Pick this Mac's built-in mic, or a wired display/interface mic — NOT
+Bluetooth headphones. Opening a headset's microphone drops it from stereo
+to mono call mode, which costs 1.5–2s before recording starts and audibly
+degrades whatever you're listening to.
+
 Verify with:
    • tap Globe with text selected → it gets rewritten
-   • hold Globe, speak, release   → transcript pasted at cursor
+   • hold Globe, speak, release   → caption appears, transcript pasted
    • Cmd+Globe with text selected → Russian audio plays
 
-Logs: ~/Documents/context-helper/rewrite.log
+Logs: ~/Documents/context-helper/rewrite.log   (all three tools)
+      /tmp/record_realtime.log                 (the recorder daemon)
 ==============================================================
 DONE

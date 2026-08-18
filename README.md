@@ -91,10 +91,13 @@ cd ~/Documents/context-helper
 
 `setup.sh` prompts for your OpenAI key (skip and add later if you prefer) and then:
 
-- Compiles `record.swift` and `history_menubar.swift` into `.app` bundles.
-- Compiles `hud.swift` and `dialog_buttons.swift`.
+- Compiles `record_realtime.swift`, `record.swift` and `history_menubar.swift`
+  into `.app` bundles, ad-hoc signing the recorder.
+- Compiles `hud.swift`, `dialog_buttons.swift`, `paste_helper.swift` and `pcm_play.swift`.
 - Installs the AI Rewrite Quick Action at `~/Library/Services/AI Rewrite.workflow`.
-- Registers the recorder daemon as a LaunchAgent (auto-starts at login).
+- Registers the **realtime** recorder daemon as a LaunchAgent (auto-starts at
+  login), and retires the legacy recorder's agent if an earlier install left one
+  behind — two recorders polling the same flags silently lose dictations.
 - Drops the Karabiner rule into `~/.config/karabiner/assets/complex_modifications/echo.json`.
 
 If you skipped the API-key prompt, add it now:
@@ -176,8 +179,11 @@ If a tool misfires, check `~/Documents/context-helper/rewrite.log` — every act
 | `rewrite_selection.sh` | Karabiner wrapper: grabs the selection via Cmd+C, then runs `rewrite.py` |
 | `dictate.py` | AI Dictate — Whisper transcription + prettification |
 | `speak.py` | AI Speak — translate-to-Russian + streaming TTS |
-| `record.swift` | Persistent voice-recording daemon (auto-started at login) |
+| `record_realtime.swift` | Streaming recorder daemon — live caption + realtime transcription (auto-started at login) |
+| `record.swift` | Legacy m4a recorder, still built as a revert path; not auto-started |
 | `history_menubar.swift` | Menubar app showing recent dictation history |
+| `paste_helper.swift` | Sends Cmd+V / Cmd+C via CGEvent, bypassing System Events |
+| `pcm_play.swift` | Plays raw PCM from stdin so AI Speak starts before the download finishes |
 | `hud.swift`, `dialog_buttons.swift` | Small UI helpers |
 | `setup.sh` | One-shot installer for everything automatable |
 | `install.sh` | Installs only the AI Rewrite Automator Quick Action (called by `setup.sh`) |
@@ -188,8 +194,10 @@ If a tool misfires, check `~/Documents/context-helper/rewrite.log` — every act
 ## Uninstall
 
 ```sh
-launchctl unload ~/Library/LaunchAgents/com.echo.context-helper.record.plist 2>/dev/null
-rm -f ~/Library/LaunchAgents/com.echo.context-helper.record.plist
+launchctl unload ~/Library/LaunchAgents/com.echo.context-helper.record-realtime.plist 2>/dev/null
+rm -f ~/Library/LaunchAgents/com.echo.context-helper.record-realtime.plist*
+rm -f ~/Library/LaunchAgents/com.echo.context-helper.record.plist*
+rm -rf "$HOME/Library/Application Support/Echo"   # stored API key + pinned mic
 rm -rf "$HOME/Library/Services/AI Rewrite.workflow"
 rm -f ~/.config/karabiner/assets/complex_modifications/echo.json
 rm -rf ~/Documents/context-helper
