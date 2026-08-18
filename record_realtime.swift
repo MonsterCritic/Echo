@@ -252,7 +252,13 @@ final class RealtimeSession {
     // speech_started/stopped events and pauses are inferred from gaps between
     // deltas instead.
     static let model = "gpt-live-transcribe"
-    static let languages = ["ru", "en"]
+    // Russian only, not ["ru","en"]. With both listed the model auto-detects per
+    // utterance and reliably mis-called the opening word as English before
+    // settling into Russian — the first word of almost every dictation. The
+    // speaker dictates in Russian; English technical terms inside that speech
+    // survive fine, and the translate step in dictate.py turns the whole thing
+    // into English regardless, so there is nothing for "en" to earn here.
+    static let languages = ["ru"]
 
     private let ws: URLSessionWebSocketTask
     private let lock = NSLock()
