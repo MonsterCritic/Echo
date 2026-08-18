@@ -5,6 +5,32 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 cd "$SCRIPT_DIR"
 
+# Long-running .app bundles are installed here rather than run from the repo.
+# If the clone lives in an iCloud-synced folder (~/Documents and ~/Desktop are
+# synced by default), the file provider stamps com.apple.FinderInfo onto the
+# bundle. That invalidates its code signature, and the kernel then kills the
+# running daemon with OS_REASON_CODESIGNING — repeatedly, because KeepAlive
+# restarts it. ~/Library is never file-provider managed, so a bundle installed
+# there keeps a valid signature. The repo stays source-only.
+BIN_DIR="$HOME/Library/Application Support/Echo/bin"
+mkdir -p "$BIN_DIR"
+
+# Build a .app bundle at $BIN_DIR/<name>.app from <name>.swift. Builds straight
+# into the destination on purpose: swiftc ad-hoc signs the binary it writes, and
+# copying it afterwards is what leaves the signature stale.
+build_app() {
+    local name="$1" plist="$2"
+    local app="$BIN_DIR/$name.app"
+    mkdir -p "$app/Contents/MacOS"
+    printf '%s' "$plist" > "$app/Contents/Info.plist"
+    swiftc -O -module-name "$name" "$name.swift" -o "$app/Contents/MacOS/$name"
+    xattr -cr "$app" 2>/dev/null || true
+    codesign --force --deep --sign - "$app" 2>/dev/null || true
+    if ! codesign -v --strict "$app" 2>/dev/null; then
+        echo "  WARNING: $name.app is not validly signed; it may be killed at launch"
+    fi
+}
+
 # ── 1. Prereqs ───────────────────────────────────────────────────────────────
 if ! command -v swiftc >/dev/null 2>&1; then
     echo "ERROR: swiftc not found. Run: xcode-select --install"
@@ -38,9 +64,7 @@ fi
 # OpenAI realtime endpoint during the hold, so the transcript is ready almost as
 # soon as you let go, and it draws the live caption while you speak.
 echo "Building record_realtime.app…"
-mkdir -p record_realtime.app/Contents/MacOS
-cat > record_realtime.app/Contents/Info.plist <<'PLIST'
-<?xml version="1.0" encoding="UTF-8"?>
+build_app record_realtime '<?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0">
 <dict>
@@ -54,32 +78,15 @@ cat > record_realtime.app/Contents/Info.plist <<'PLIST'
     <key>NSMicrophoneUsageDescription</key><string>Streaming your voice for realtime AI dictation.</string>
     <key>NSAppSleepDisabled</key><true/>
 </dict>
-</plist>
-PLIST
-swiftc -O -module-name record_realtime record_realtime.swift \
-    -o record_realtime.app/Contents/MacOS/record_realtime
-# Sign it, but clear two things first or the signature won't verify:
-#   • a stale _CodeSignature, whose CodeResources still claims resources the
-#     rebuilt bundle no longer has ("code has no resources but signature
-#     indicates they must be present");
-#   • com.apple.FinderInfo, which iCloud-synced folders stamp onto directories
-#     and codesign rejects outright as "detritus".
-# An unverifiable bundle still runs under a direct-exec LaunchAgent, but macOS
-# refuses to `open` it (LaunchServices -10825), which is a confusing way to fail.
-rm -rf record_realtime.app/Contents/_CodeSignature
-xattr -d com.apple.FinderInfo record_realtime.app 2>/dev/null || true
-xattr -cr record_realtime.app 2>/dev/null || true
-codesign -s - -f record_realtime.app 2>/dev/null || true
+</plist>'
 
 # ── 3b. Build record.app ─────────────────────────────────────────────────────
 # The legacy recorder: writes an m4a, which dictate.py then uploads. Superseded
 # by record_realtime.app above and NOT auto-started, but still built so the old
-# path stays one step away — set REALTIME_MODE = False in dictate.py and load
-# this bundle's LaunchAgent instead.
+# path stays one step away — set REALTIME_MODE = False in dictate.py and point
+# the LaunchAgent at this bundle instead.
 echo "Building record.app (legacy m4a recorder, kept for revert)…"
-mkdir -p record.app/Contents/MacOS
-cat > record.app/Contents/Info.plist <<'PLIST'
-<?xml version="1.0" encoding="UTF-8"?>
+build_app record '<?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0">
 <dict>
@@ -93,15 +100,13 @@ cat > record.app/Contents/Info.plist <<'PLIST'
     <key>NSMicrophoneUsageDescription</key><string>Recording your voice for AI dictation.</string>
     <key>NSAppSleepDisabled</key><true/>
 </dict>
-</plist>
-PLIST
-swiftc -O record.swift -o record.app/Contents/MacOS/record
+</plist>'
 
 # ── 4. Build history_menubar.app ─────────────────────────────────────────────
+# Menubar app: recent dictations, a stop control while AI Speak is talking, and
+# the Microphone picker.
 echo "Building history_menubar.app…"
-mkdir -p history_menubar.app/Contents/MacOS
-cat > history_menubar.app/Contents/Info.plist <<'PLIST'
-<?xml version="1.0" encoding="UTF-8"?>
+build_app history_menubar '<?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0">
 <dict>
@@ -113,9 +118,7 @@ cat > history_menubar.app/Contents/Info.plist <<'PLIST'
     <key>CFBundleVersion</key><string>1</string>
     <key>LSUIElement</key><true/>
 </dict>
-</plist>
-PLIST
-swiftc -O history_menubar.swift -o history_menubar.app/Contents/MacOS/history_menubar
+</plist>'
 
 # ── 5. Build standalone helpers ──────────────────────────────────────────────
 echo "Building helper binaries…"
@@ -160,7 +163,7 @@ cat > "$PLIST_PATH" <<EOF
     <key>Label</key><string>com.echo.context-helper.record-realtime</string>
     <key>ProgramArguments</key>
     <array>
-        <string>$SCRIPT_DIR/record_realtime.app/Contents/MacOS/record_realtime</string>
+        <string>$BIN_DIR/record_realtime.app/Contents/MacOS/record_realtime</string>
     </array>
     <key>RunAtLoad</key><true/>
     <key>KeepAlive</key><true/>
@@ -234,10 +237,10 @@ THESE THREE STEPS REQUIRE GUI CLICKS — they cannot be scripted:
    Approve all of them.
 
 RECOMMENDED — pin one microphone, so dictation always records from the
-same input instead of following whatever macOS has selected. See which
-inputs this Mac has:
+same input instead of following whatever macOS has selected. Easiest way
+is the menubar icon → Microphone. From a shell, list the inputs with:
 
-   ./record_realtime.app/Contents/MacOS/record_realtime --list-inputs
+   "$HOME/Library/Application Support/Echo/bin/record_realtime.app/Contents/MacOS/record_realtime" --list-inputs
 
 Then write the one you want into the config and restart the recorder:
 

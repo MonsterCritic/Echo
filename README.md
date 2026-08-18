@@ -92,7 +92,12 @@ cd ~/Documents/context-helper
 `setup.sh` prompts for your OpenAI key (skip and add later if you prefer) and then:
 
 - Compiles `record_realtime.swift`, `record.swift` and `history_menubar.swift`
-  into `.app` bundles, ad-hoc signing the recorder.
+  into signed `.app` bundles under
+  `~/Library/Application Support/Echo/bin/` — **not** in the repo. If the clone
+  lives in an iCloud-synced folder (`~/Documents` and `~/Desktop` are synced by
+  default), the file provider stamps `com.apple.FinderInfo` onto the bundle,
+  which invalidates its signature; the kernel then kills the daemon with
+  `OS_REASON_CODESIGNING` on a loop. `~/Library` is never file-provider managed.
 - Compiles `hud.swift`, `dialog_buttons.swift`, `paste_helper.swift` and `pcm_play.swift`.
 - Installs the AI Rewrite Quick Action at `~/Library/Services/AI Rewrite.workflow`.
 - Registers the **realtime** recorder daemon as a LaunchAgent (auto-starts at
@@ -142,10 +147,20 @@ onto them.
 > Installing with Claude Code? Ask it to set this up — it can list your inputs
 > and write the config file for you. It should suggest your built-in mic.
 
-List the inputs available on your machine:
+**The easy way is the menubar icon → Microphone.** It lists every input, marks
+Bluetooth ones, checkmarks the one you've pinned, and titles itself with the mic
+actually in use. Picking an entry writes the config and restarts the recorder for
+you; **System Default** removes the pin.
+
+That menu also surfaces a failure the config file can't: pinning is a request, and
+`AudioUnitSetProperty` can return success without the engine honoring it. The
+recorder reads the device back after pinning and publishes what it really got, so
+if the two disagree the menu says so outright — `⚠︎ pinned to X — recording from Y`.
+
+From a shell, list the inputs with:
 
 ```sh
-./record_realtime.app/Contents/MacOS/record_realtime --list-inputs
+"$HOME/Library/Application Support/Echo/bin/record_realtime.app/Contents/MacOS/record_realtime" --list-inputs
 ```
 
 Then pin one by name (matching is case-insensitive and partial):
@@ -153,11 +168,18 @@ Then pin one by name (matching is case-insensitive and partial):
 ```sh
 mkdir -p "$HOME/Library/Application Support/Echo"
 echo 'MacBook Pro Microphone' > "$HOME/Library/Application Support/Echo/input_device"
+launchctl kickstart -k "gui/$(id -u)/com.echo.context-helper.record-realtime"
 ```
 
-Restart the recorder to apply it. Delete the file to go back to the system
-default. If the named device isn't connected, the recorder logs that and falls
-back to the default, so unplugging it never breaks dictation.
+The recorder reads the pin once at startup, hence the restart. Delete the file to
+go back to the system default. If the named device isn't connected, the recorder
+logs that and falls back to the default, so unplugging it never breaks dictation.
+
+One trade-off worth measuring on your own hardware: pinning can cost latency. On
+a Studio Display mic the engine took ~450ms to open versus ~35ms for the default,
+pushing the caption from ~140ms to ~555ms after the keypress. A far-field display
+mic also recognises noticeably worse than a close-talking headset. Pin for
+predictability, not because it's automatically better.
 
 ### Verify
 
@@ -181,7 +203,7 @@ If a tool misfires, check `~/Documents/context-helper/rewrite.log` — every act
 | `speak.py` | AI Speak — translate-to-Russian + streaming TTS |
 | `record_realtime.swift` | Streaming recorder daemon — live caption + realtime transcription (auto-started at login) |
 | `record.swift` | Legacy m4a recorder, still built as a revert path; not auto-started |
-| `history_menubar.swift` | Menubar app showing recent dictation history |
+| `history_menubar.swift` | Menubar app: recent dictations, Stop Speaking, and the Microphone picker |
 | `paste_helper.swift` | Sends Cmd+V / Cmd+C via CGEvent, bypassing System Events |
 | `pcm_play.swift` | Plays raw PCM from stdin so AI Speak starts before the download finishes |
 | `hud.swift`, `dialog_buttons.swift` | Small UI helpers |
@@ -197,7 +219,7 @@ If a tool misfires, check `~/Documents/context-helper/rewrite.log` — every act
 launchctl unload ~/Library/LaunchAgents/com.echo.context-helper.record-realtime.plist 2>/dev/null
 rm -f ~/Library/LaunchAgents/com.echo.context-helper.record-realtime.plist*
 rm -f ~/Library/LaunchAgents/com.echo.context-helper.record.plist*
-rm -rf "$HOME/Library/Application Support/Echo"   # stored API key + pinned mic
+rm -rf "$HOME/Library/Application Support/Echo"   # installed apps, API key, pinned mic
 rm -rf "$HOME/Library/Services/AI Rewrite.workflow"
 rm -f ~/.config/karabiner/assets/complex_modifications/echo.json
 rm -rf ~/Documents/context-helper

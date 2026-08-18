@@ -488,6 +488,14 @@ final class RealtimeSession {
 let inputDeviceFile = NSString(string: "~/Library/Application Support/Echo/input_device")
                       .expandingTildeInPath
 
+// Where we publish the device the engine is REALLY on, for the menubar to read.
+// Only written when a pin was attempted — that's the only case where "what we
+// asked for" and "what we got" can disagree. With no pin the menubar resolves
+// the system default itself, so the daemon needn't touch the engine at all.
+// Lives in /tmp deliberately: it describes this process's live state and should
+// not outlive it.
+let actualInputFile = "/tmp/echo_input_actual.txt"
+
 /// nil = use whatever macOS has selected.
 func preferredInputName() -> String? {
     guard let s = try? String(contentsOfFile: inputDeviceFile, encoding: .utf8) else { return nil }
@@ -509,6 +517,18 @@ func hasInputChannels(_ id: AudioDeviceID) -> Bool {
     guard AudioObjectGetPropertyData(id, &addr, 0, nil, &size, raw) == noErr else { return false }
     let list = UnsafeMutableAudioBufferListPointer(raw.assumingMemoryBound(to: AudioBufferList.self))
     return list.reduce(0) { $0 + Int($1.mNumberChannels) } > 0
+}
+
+/// Human-readable name of one device.
+func deviceName(_ id: AudioDeviceID) -> String? {
+    var addr = AudioObjectPropertyAddress(
+        mSelector: kAudioObjectPropertyName,
+        mScope: kAudioObjectPropertyScopeGlobal,
+        mElement: kAudioObjectPropertyElementMain)
+    var cfName: CFString = "" as CFString
+    var sz = UInt32(MemoryLayout<CFString?>.size)
+    guard AudioObjectGetPropertyData(id, &addr, 0, nil, &sz, &cfName) == noErr else { return nil }
+    return cfName as String
 }
 
 func inputDevice(matching target: String) -> AudioDeviceID? {
@@ -594,6 +614,32 @@ func pinInputDevice() {
                                   kAudioUnitScope_Global, 0,
                                   &devID, UInt32(MemoryLayout<AudioDeviceID>.size))
     log(st == noErr ? "input pinned to '\(want)'" : "could not pin input (OSStatus \(st))")
+
+    // Read back what the unit is on now. noErr above does NOT prove the engine
+    // honored the request, and on hardware where every input shares a sample rate
+    // the "in: NHz" line can't tell the devices apart — so a read-back is the only
+    // trustworthy answer to "which mic is this actually recording from?".
+    var actual = ""
+    if let id = currentInputDevice(unit), let name = deviceName(id) {
+        actual = name
+        if !name.localizedCaseInsensitiveContains(want) {
+            log("WARNING: pin reported success but the unit is on '\(name)'")
+        } else {
+            log("input device in use: '\(name)'")
+        }
+    } else {
+        log("could not read back the input device in use")
+    }
+    try? actual.write(toFile: actualInputFile, atomically: true, encoding: .utf8)
+}
+
+/// Which device the engine's input unit is on right now.
+func currentInputDevice(_ unit: AudioUnit) -> AudioDeviceID? {
+    var devID = AudioDeviceID(0)
+    var sz = UInt32(MemoryLayout<AudioDeviceID>.size)
+    guard AudioUnitGetProperty(unit, kAudioOutputUnitProperty_CurrentDevice,
+                               kAudioUnitScope_Global, 0, &devID, &sz) == noErr else { return nil }
+    return devID
 }
 
 // ── Live PCM capture (AVAudioEngine → 24kHz Int16) ───────────────────────────
