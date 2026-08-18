@@ -47,7 +47,15 @@ Select English text, press Cmd+Globe, and hear it read aloud in Russian — with
 4. A second Cmd+Globe press while playback is in progress kills the entire pipeline (current `afplay` + pending synthesis jobs).
 
 ### 📋 History menubar
-A small menubar app (`history_menubar.app`) shows the last few dictation results, so anything that didn't land in the right window is one click away from re-copying.
+A small menubar app (`history_menubar.app`). Click the waveform icon — either
+mouse button — for:
+
+- **Recent** — the last 8 dictations and rewrites, newest first. Click one to copy
+  it, so anything that landed in the wrong window is recoverable without opening
+  the file. ⌘C still copies the newest.
+- **Microphone** — pick the input the recorder uses (see below).
+- **Stop Speaking** — shown only while AI Speak is talking.
+- **Open Full History** — the whole markdown file in your editor.
 
 ---
 

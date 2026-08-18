@@ -20,6 +20,19 @@ let historyURL  = URL(fileURLWithPath: historyPath)
 // item so playback can be stopped by mouse too.
 let speakPIDPath = "/tmp/rewrite_speak.pid"
 
+/// One-shot latch: `claim()` returns true for the first caller only. Used where
+/// two racing paths may each want to act and exactly one should.
+final class SettledOnce {
+    private let lock = NSLock()
+    private var taken = false
+    func claim() -> Bool {
+        lock.lock(); defer { lock.unlock() }
+        if taken { return false }
+        taken = true
+        return true
+    }
+}
+
 // ── Microphone selection ─────────────────────────────────────────────────────
 // Two separate facts, deliberately kept apart:
 //   inputDeviceFile  — the device the user CHOSE (absent = follow macOS)
@@ -163,10 +176,12 @@ class StatusController: NSObject, NSMenuDelegate {
         if let button = item.button {
             button.image = NSImage(systemSymbolName: "waveform",
                                    accessibilityDescription: "Dictation History")
-            button.target = self
-            button.action = #selector(handleClick(_:))
-            button.sendAction(on: [.leftMouseUp, .rightMouseUp])
         }
+
+        // Attach the menu permanently, so either mouse button opens it. A left
+        // click used to copy the newest entry outright, which reads as "nothing
+        // happened" — copying is now an explicit item you can see and aim at.
+        item.menu = menu
 
         // Re-populate the menu every time it opens so the "Copy Last…" item
         // reflects the actual most-recent dictation.
@@ -195,15 +210,30 @@ class StatusController: NSObject, NSMenuDelegate {
             menu.addItem(NSMenuItem.separator())
         }
 
-        let last = lastFinal()
-        let preview = last.flatMap { previewText($0) }
-        let copyTitle = preview.map { "Copy Last: \"\($0)\"" } ?? "Copy Last Message"
-        let copyItem = NSMenuItem(title: copyTitle,
-                                  action: #selector(copyLast),
-                                  keyEquivalent: "c")
-        copyItem.target = self
-        copyItem.isEnabled = (last != nil)
-        menu.addItem(copyItem)
+        // Recent results, newest first — clicking one copies it. Anything that
+        // landed in the wrong window is recoverable from here without opening
+        // the file.
+        let recents = recentEntries(limit: 8)
+        if recents.isEmpty {
+            let empty = NSMenuItem(title: "No history yet", action: nil, keyEquivalent: "")
+            empty.isEnabled = false
+            menu.addItem(empty)
+        } else {
+            let heading = NSMenuItem(title: "Recent — click to copy", action: nil, keyEquivalent: "")
+            heading.isEnabled = false
+            menu.addItem(heading)
+            for (i, entry) in recents.enumerated() {
+                let item = NSMenuItem(title: previewText(entry.text, maxLen: 55),
+                                      action: #selector(copyEntry(_:)),
+                                      // Keep ⌘C on the newest, matching what the
+                                      // old single Copy Last item was bound to.
+                                      keyEquivalent: i == 0 ? "c" : "")
+                item.target = self
+                item.representedObject = entry.text
+                item.toolTip = "\(entry.header)\n\n\(entry.text)"
+                menu.addItem(item)
+            }
+        }
 
         menu.addItem(NSMenuItem.separator())
 
@@ -257,7 +287,7 @@ class StatusController: NSObject, NSMenuDelegate {
         menu.addItem(micRoot)
         menu.addItem(NSMenuItem.separator())
 
-        let openItem = NSMenuItem(title: "Open History",
+        let openItem = NSMenuItem(title: "Open Full History",
                                   action: #selector(openHistory),
                                   keyEquivalent: "")
         openItem.target = self
@@ -284,34 +314,45 @@ class StatusController: NSObject, NSMenuDelegate {
     ///   • Dictate single-call — plain text under the header
     ///   • Dictate two-step    — text under `**Final:**`
     ///   • Rewrite             — text under `**Rewritten:**`
-    func lastFinal() -> String? {
+    /// One history entry: its `## ` header line and the output text.
+    struct HistoryEntry {
+        let header: String      // e.g. "2026-08-18 13:06:38 · Dictate"
+        let text: String
+    }
+
+    /// The newest `limit` entries, newest first.
+    ///
+    /// History is prepended, so file order is already newest-first. Entries are
+    /// separated by a `---` rule and each begins with a `## <time> · <kind>`
+    /// header. The output text sits under a marker that varies by tool, so they
+    /// are tried in order of specificity; a Dictate entry carries both a raw
+    /// transcript and a final, and the final is the one worth copying.
+    func recentEntries(limit: Int) -> [HistoryEntry] {
         guard let content = try? String(contentsOfFile: historyPath,
-                                        encoding: .utf8) else { return nil }
-        // Newest entry = first "## " header (prepended history).
-        guard let headerRange = content.range(of: "## ") else { return nil }
-        let afterHeader = content[headerRange.lowerBound...]
-        // Block ends at the next "---" separator or end of file.
-        let blockEnd = afterHeader.range(of: "\n---")
-        let block = blockEnd.map { String(afterHeader[..<$0.lowerBound]) }
-                    ?? String(afterHeader)
+                                        encoding: .utf8) else { return [] }
+        var out: [HistoryEntry] = []
+        for block in content.components(separatedBy: "\n---") {
+            if out.count >= limit { break }
+            guard let hRange = block.range(of: "## ") else { continue }
+            let afterHeader = block[hRange.upperBound...]
+            guard let nl = afterHeader.firstIndex(of: "\n") else { continue }
+            let header = String(afterHeader[..<nl]).trimmingCharacters(in: .whitespaces)
+            let rest   = String(afterHeader[afterHeader.index(after: nl)...])
 
-        func textAfter(_ marker: String) -> String? {
-            guard let r = block.range(of: marker) else { return nil }
-            return String(block[r.upperBound...])
-        }
+            func textAfter(_ marker: String) -> String? {
+                guard let r = rest.range(of: marker) else { return nil }
+                return String(rest[r.upperBound...])
+            }
 
-        let body: String
-        if let t = textAfter("**Rewritten:**") {        // rewrite → corrected text
-            body = t
-        } else if let t = textAfter("**Final:**") {      // dictate two-step → final
-            body = t
-        } else if let nl = block.firstIndex(of: "\n") {  // plain entry → drop header line
-            body = String(block[block.index(after: nl)...])
-        } else {
-            body = block
+            let body = textAfter("**Rewritten:**")          // Rewrite
+                    ?? textAfter("**Final:**")              // Dictate, prettified
+                    ?? textAfter("**Raw transcript:**")     // Dictate, prettify failed
+                    ?? rest                                 // plain entry
+            let text = body.trimmingCharacters(in: .whitespacesAndNewlines)
+            if text.isEmpty { continue }
+            out.append(HistoryEntry(header: header, text: text))
         }
-        let text = body.trimmingCharacters(in: .whitespacesAndNewlines)
-        return text.isEmpty ? nil : text
+        return out
     }
 
     /// Short truncated preview for the menu item label.
@@ -340,26 +381,13 @@ class StatusController: NSObject, NSMenuDelegate {
         button.image = NSImage(systemSymbolName: name, accessibilityDescription: desc)
     }
 
-    @objc func copyLast() {
-        guard let text = lastFinal() else { return }
+    /// Copy one entry, carried on the menu item itself.
+    @objc func copyEntry(_ sender: NSMenuItem) {
+        guard let text = sender.representedObject as? String else { return }
         let pb = NSPasteboard.general
         pb.clearContents()
         pb.setString(text, forType: .string)
-    }
-
-    @objc func handleClick(_ sender: NSStatusBarButton) {
-        let event = NSApp.currentEvent
-        if event?.type == .rightMouseUp {
-            // Show the menu on right-click.
-            item.menu = menu
-            item.button?.performClick(nil)
-            // Detach so subsequent left-clicks fire the action again.
-            DispatchQueue.main.async { [weak self] in self?.item.menu = nil }
-        } else {
-            // Left click: copy last message + audible click feedback.
-            copyLast()
-            playMorse()
-        }
+        playMorse()
     }
 
     func playMorse() {
@@ -387,9 +415,53 @@ class StatusController: NSObject, NSMenuDelegate {
         restartRecorder()
     }
 
+    /// Open the history file for reading.
+    ///
+    /// Harder than it looks, because the registered handler may be installed and
+    /// still not launch. On this machine Sublime Text claims plain text, exists
+    /// on disk with a valid signature, and simply never comes up: the synchronous
+    /// NSWorkspace.open() blocks for minutes, and the asynchronous one never calls
+    /// back at all. Either way the menu item appeared to do nothing.
+    ///
+    /// So: launch the handler asynchronously (never block the menubar), and if it
+    /// hasn't come up shortly, open TextEdit instead — it ships with macOS, so it
+    /// is always there. A handler that works keeps working; one that hangs stops
+    /// being a dead end.
     @objc func openHistory() {
         ensureHistoryFile()
-        NSWorkspace.shared.open(historyURL)
+        let fm = FileManager.default
+        let textEdit = URL(fileURLWithPath: "/System/Applications/TextEdit.app")
+
+        guard let handler = NSWorkspace.shared.urlForApplication(toOpen: historyURL),
+              fm.fileExists(atPath: handler.path),
+              handler != textEdit else {
+            openHistoryUsing(textEdit)
+            return
+        }
+
+        // Whichever of the two paths gets here first wins, so the file is never
+        // opened twice.
+        let settled = SettledOnce()
+        NSWorkspace.shared.open([historyURL], withApplicationAt: handler,
+                                configuration: NSWorkspace.OpenConfiguration()) { running, _ in
+            guard running == nil, settled.claim() else { return }   // only on failure
+            DispatchQueue.main.async { [weak self] in self?.openHistoryUsing(textEdit) }
+        }
+        DispatchQueue.main.asyncAfter(deadline: .now() + 3.0) { [weak self] in
+            guard settled.claim() else { return }
+            self?.openHistoryUsing(textEdit)
+        }
+    }
+
+    private func openHistoryUsing(_ app: URL) {
+        guard FileManager.default.fileExists(atPath: app.path) else {
+            // Nothing can open it — at least put the file in front of the user.
+            NSWorkspace.shared.activateFileViewerSelecting([historyURL])
+            return
+        }
+        NSWorkspace.shared.open([historyURL], withApplicationAt: app,
+                                configuration: NSWorkspace.OpenConfiguration(),
+                                completionHandler: nil)
     }
 
     @objc func showInFinder() {
