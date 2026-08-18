@@ -704,11 +704,39 @@ func startRecording() {
     pinSettled.signal()   // keep it available for later recordings
 
     let input = engine.inputNode
-    let inFormat = input.outputFormat(forBus: 0)
-    converter = AVAudioConverter(from: inFormat, to: targetFormat)
+    let nodeFormat = input.outputFormat(forBus: 0)
+
+    // A device that isn't ready reports a zero format, and handing that to the
+    // engine is another way to die. Skip the recording instead, and still raise
+    // the ready flag so dictate.py doesn't wait for a handoff that never comes.
+    guard nodeFormat.sampleRate > 0, nodeFormat.channelCount > 0 else {
+        log("input not ready (\(nodeFormat.sampleRate)Hz, \(nodeFormat.channelCount)ch) — skipping this recording")
+        stateLock.lock(); isRecording = false; stateLock.unlock()
+        LiveHUD.shared.hide()
+        try? "".write(toFile: transcriptPath, atomically: true, encoding: .utf8)
+        FileManager.default.createFile(atPath: readyFlag, contents: Data())
+        s.close(); session = nil
+        return
+    }
+
+    // Pass nil, never a format we read ourselves. Pinning a different input
+    // device changes this node's format, and installTap raises an Objective-C
+    // exception when the format handed to it disagrees with the node's own:
+    // "Failed to create tap due to format mismatch". Swift cannot catch that, so
+    // it terminated the daemon outright and KeepAlive restarted it straight into
+    // the same crash — the recorder ceased to exist the moment a mic was pinned.
+    // nil means "use whatever this node is on right now".
+    converter = nil                 // rebuilt below from the first real buffer
     var loggedFirst = false
     var hudShown = false
-    input.installTap(onBus: 0, bufferSize: 2048, format: inFormat) { buffer, _ in
+    input.installTap(onBus: 0, bufferSize: 2048, format: nil) { buffer, _ in
+        // Build the converter from the buffer we are actually handed, so a device
+        // change can't leave one behind that still expects the previous rate.
+        if let c = converter, c.inputFormat.isEqual(buffer.format) {
+            // reuse
+        } else {
+            converter = AVAudioConverter(from: buffer.format, to: targetFormat)
+        }
         guard let pcm = convertToPCM16(buffer), !pcm.isEmpty else {
             if !loggedFirst { loggedFirst = true; log("tap: got buffer frames=\(buffer.frameLength) but conversion produced nothing") }
             return
@@ -729,9 +757,23 @@ func startRecording() {
     do {
         try engine.start()
         let ms = Int(Date().timeIntervalSince(pressedAt) * 1000)
-        log("recording started (in: \(inFormat.sampleRate)Hz, \(ms)ms after press)")
+        log("recording started (in: \(nodeFormat.sampleRate)Hz, \(ms)ms after press)")
     }
-    catch { log("engine start failed: \(error)") }
+    catch {
+        log("engine start failed: \(error)")
+
+        // -10868 (FormatNotSupported) here means an input pin is configured.
+        // Merely setting kAudioOutputUnitProperty_CurrentDevice on this engine's
+        // input unit at startup leaves the graph unable to start at all, and it
+        // does not recover in-process: switching the unit back to the system
+        // default and resetting the engine fails identically. So the pin is not
+        // just ineffective, it is fatal to capture, and the only cure is removing
+        // it and restarting. Say so plainly rather than leaving silent recordings.
+        if let want = preferredInputName() {
+            log("PIN IS BREAKING CAPTURE: '\(want)' is pinned and this engine cannot start.")
+            log("Remove it — menubar → Microphone → System Default — then restart the recorder.")
+        }
+    }
 }
 
 func stopRecording() {
