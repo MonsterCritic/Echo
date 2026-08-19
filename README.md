@@ -35,7 +35,7 @@ Hold Globe to record, release to paste a clean transcript at the cursor.
    - *"don't translate" / "не переводи"* → keep the original language.
    - *"leave as is" / "verbatim" / "оставь как есть"* → no translation, no prettification, raw output.
 6. The result is written to a markdown history file (`dictate_history.md`) **before** pasting — so even if the paste lands in the wrong window, the text is recoverable.
-7. The original frontmost app is brought back to front, then `Cmd+V` is sent. The clipboard is held for 5 seconds afterward so you can manually paste again if the auto-paste missed the input.
+7. The original frontmost app is brought back to front, then `Cmd+V` is sent, and your previous clipboard is restored half a second later — the dictated text doesn't linger there. If a paste ever misses, the menubar's **Recent** list copies any of the last 8 results back.
 
 ### 🔊 AI Speak — *Cmd+Globe with text selected*
 Select English text, press Cmd+Globe, and hear it read aloud in Russian — with streaming playback that starts within ~1 second regardless of total length.

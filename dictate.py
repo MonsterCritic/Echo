@@ -487,13 +487,21 @@ display dialog "{safe}" with title "AI Dictate — Error" buttons {{"OK"}} defau
 # ── Pipeline ────────────────────────────────────────────────────────────────
 
 def _delayed_restore(saved: str, clean: str):
-    """Keep the dictated text on the clipboard for a few seconds so the user
-    can manually Cmd+V if the auto-paste missed, then restore their previous
-    clipboard. Only restore if our text is still there — if a newer dictation
-    or a manual copy took over, leave it alone. Runs in a (non-daemon) thread
-    so the warm worker's loop stays responsive for back-to-back dictations
-    instead of blocking on the 5s hold."""
-    time.sleep(5.0)
+    """Put the user's own clipboard back once the paste has landed.
+
+    Pasting has to go through the clipboard, but the dictated text has no reason
+    to stay there afterwards — it overwrites whatever was being carried around
+    and shows up in the next paste. This used to hold it for 5 seconds as a
+    manual fallback in case the auto-paste missed; the menubar now lists the
+    last several results for one-click copying, so that fallback has a better
+    home and the clipboard can be handed straight back. Matches AI Rewrite,
+    which has always restored after 0.5s.
+
+    Only restores if our text is still on the clipboard — if a newer dictation
+    or a manual copy took over in the meantime, leave it alone. Runs in a
+    (non-daemon) thread so back-to-back dictations stay responsive.
+    """
+    time.sleep(0.5)
     try:
         if read_clipboard() == clean:
             write_clipboard(saved)
