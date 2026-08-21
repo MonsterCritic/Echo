@@ -31,9 +31,16 @@ Hold Globe to record, release to paste a clean transcript at the cursor.
 2. Karabiner touches `/tmp/rewrite_record_start` on press and removes it on release. The daemon polls that flag every 50 ms and starts/stops `AVAudioRecorder` accordingly. It also captures the frontmost app name at press time so the paste lands where you started, even if focus drifts.
 3. On release, `dictate.py` uploads the m4a to OpenAI's `gpt-4o-mini-transcribe`.
 4. The transcript is sent to `gpt-4.1-mini` for prettification: filler words removed, punctuation added, run-on dictation turned into clean prose. Non-English speech is translated to English.
-5. **Voice commands** at the start of the transcript override the default behavior:
+5. **Voice commands** at the start of the transcript override the default behavior
+   for that one dictation, whichever way **Language** is set:
    - *"don't translate" / "не переводи"* → keep the original language.
+   - *"translate" / "переведи на английский"* → translate after all.
    - *"leave as is" / "verbatim" / "оставь как есть"* → no translation, no prettification, raw output.
+
+   With **Language: English**, the result is checked afterwards: output that is
+   still Russian gets an explicit translation pass, since the model occasionally
+   prettifies without translating (5% of 167 logged dictations). The check is
+   skipped when you asked to keep the original.
 6. The result is written to a markdown history file (`dictate_history.md`) **before** pasting — so even if the paste lands in the wrong window, the text is recoverable.
 7. The original frontmost app is brought back to front, then `Cmd+V` is sent, and your previous clipboard is restored half a second later — the dictated text doesn't linger there. If a paste ever misses, the menubar's **Recent** list copies any of the last 8 results back.
 
@@ -54,6 +61,9 @@ mouse button — for:
   it, so anything that landed in the wrong window is recoverable without opening
   the file. ⌘C still copies the newest.
 - **Microphone** — pick the input the recorder uses (see below).
+- **Language** — whether dictation is pasted in **English** (translated) or
+  **Russian** (exactly what you said, just tidied). Applies from the next hold;
+  nothing restarts. A voice command still overrides it for one dictation.
 - **Stop Speaking** — shown only while AI Speak is talking.
 - **Open Full History** — the whole markdown file in your editor.
 

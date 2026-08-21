@@ -47,6 +47,24 @@ let inputDeviceFile = NSString(string: "~/Library/Application Support/Echo/input
 let actualInputFile = "/tmp/echo_input_actual.txt"
 let recorderLabel   = "com.echo.context-helper.record-realtime"
 
+// ── Language of the pasted text ──────────────────────────────────────────────
+// dictate.py reads this on every dictation, so a change takes effect on the very
+// next hold and nothing needs restarting.
+let outputLangFile = NSString(string: "~/Library/Application Support/Echo/output_language")
+                     .expandingTildeInPath
+
+/// "ru" pastes what was spoken; "en" translates. English is the default.
+func pastedLanguage() -> String {
+    guard let raw = try? String(contentsOfFile: outputLangFile, encoding: .utf8) else { return "en" }
+    return raw.trimmingCharacters(in: .whitespacesAndNewlines).lowercased().hasPrefix("ru") ? "ru" : "en"
+}
+
+func setPastedLanguage(_ code: String) {
+    let dir = (outputLangFile as NSString).deletingLastPathComponent
+    try? FileManager.default.createDirectory(atPath: dir, withIntermediateDirectories: true)
+    try? (code + "\n").write(toFile: outputLangFile, atomically: true, encoding: .utf8)
+}
+
 func trimmedContents(of path: String) -> String? {
     guard let s = try? String(contentsOfFile: path, encoding: .utf8) else { return nil }
     let t = s.trimmingCharacters(in: .whitespacesAndNewlines)
@@ -304,6 +322,30 @@ class StatusController: NSObject, NSMenuDelegate {
 
         micRoot.submenu = micMenu
         menu.addItem(micRoot)
+
+        // ── Language of the pasted text ──────────────────────────────────────
+        let lang = pastedLanguage()
+        let langRoot = NSMenuItem(title: "Language: \(lang == "ru" ? "Russian" : "English")",
+                                  action: nil, keyEquivalent: "")
+        let langMenu = NSMenu()
+        for (code, title, tip) in [
+            ("en", "English", "Translate what you dictate into English."),
+            ("ru", "Russian", "Paste what you actually said, without translating."),
+        ] {
+            let item = NSMenuItem(title: title, action: #selector(pickLanguage(_:)), keyEquivalent: "")
+            item.target = self
+            item.representedObject = code
+            item.state = (code == lang) ? .on : .off
+            item.toolTip = tip
+            langMenu.addItem(item)
+        }
+        langMenu.addItem(NSMenuItem.separator())
+        let langNote = NSMenuItem(title: "Language of the pasted text", action: nil, keyEquivalent: "")
+        langNote.isEnabled = false
+        langMenu.addItem(langNote)
+
+        langRoot.submenu = langMenu
+        menu.addItem(langRoot)
         menu.addItem(NSMenuItem.separator())
 
         let openItem = NSMenuItem(title: "Open Full History",
@@ -428,6 +470,13 @@ class StatusController: NSObject, NSMenuDelegate {
         try? FileManager.default.removeItem(atPath: inputDeviceFile)
         try? FileManager.default.removeItem(atPath: actualInputFile)
         restartRecorder()
+    }
+
+    /// Takes effect on the next dictation — dictate.py re-reads the setting each
+    /// time, so there is nothing to restart here.
+    @objc func pickLanguage(_ sender: NSMenuItem) {
+        guard let code = sender.representedObject as? String else { return }
+        setPastedLanguage(code)
     }
 
     /// Open the history file for reading.
