@@ -47,6 +47,105 @@ let inputDeviceFile = NSString(string: "~/Library/Application Support/Echo/input
 let actualInputFile = "/tmp/echo_input_actual.txt"
 let recorderLabel   = "com.echo.context-helper.record-realtime"
 
+// ── Remembering the chosen microphone ────────────────────────────────────────
+// Stored by NAME, not by CoreAudio id: ids are assigned per connection, so a
+// headset that reconnects comes back with a different one while the name holds.
+let preferredInputFile = NSString(string: "~/Library/Application Support/Echo/preferred_input")
+                         .expandingTildeInPath
+
+/// The microphone to keep selected, or nil to follow whatever macOS picks.
+func preferredInput() -> String? { trimmedContents(of: preferredInputFile) }
+
+func setPreferredInput(_ name: String?) {
+    guard let name = name else {
+        try? FileManager.default.removeItem(atPath: preferredInputFile)
+        return
+    }
+    let dir = (preferredInputFile as NSString).deletingLastPathComponent
+    try? FileManager.default.createDirectory(atPath: dir, withIntermediateDirectories: true)
+    try? (name + "\n").write(toFile: preferredInputFile, atomically: true, encoding: .utf8)
+}
+
+func guardLog(_ msg: String) {
+    let line = "[\(ISO8601DateFormatter().string(from: Date()))] \(msg)\n"
+    if let data = line.data(using: .utf8) {
+        if let fh = FileHandle(forWritingAtPath: "/tmp/echo_menubar.log") {
+            fh.seekToEndOfFile(); fh.write(data); fh.closeFile()
+        } else {
+            try? data.write(to: URL(fileURLWithPath: "/tmp/echo_menubar.log"))
+        }
+    }
+}
+
+/// Keeps the chosen microphone selected.
+///
+/// macOS moves the default input on its own — plug in a Bluetooth headset and it
+/// becomes the input, silently replacing the mic that was picked. Setting the
+/// device once is therefore not enough: something has to notice the change and
+/// put it back. CoreAudio will say when the default input changes and when the
+/// device list changes, so this listens for both and re-asserts the choice.
+final class InputGuard {
+    static let shared = InputGuard()
+    private var coalescing = false
+    // Remembers what was last reported, so the once-a-second check reports a
+    // change of state rather than restating the same one every tick.
+    private var reportedMissing: String?
+
+    func install() {
+        for selector in [kAudioHardwarePropertyDefaultInputDevice,
+                         kAudioHardwarePropertyDevices] {
+            var addr = AudioObjectPropertyAddress(
+                mSelector: selector,
+                mScope: kAudioObjectPropertyScopeGlobal,
+                mElement: kAudioObjectPropertyElementMain)
+            AudioObjectAddPropertyListenerBlock(
+                AudioObjectID(kAudioObjectSystemObject), &addr, DispatchQueue.main
+            ) { [weak self] _, _ in self?.schedule() }
+        }
+        // A headset already connected at login has taken the input before we got
+        // here, so make one pass at startup too.
+        schedule()
+    }
+
+    /// Connecting one device emits a burst of notifications; act once per burst.
+    private func schedule() {
+        if coalescing { return }
+        coalescing = true
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.5) { [weak self] in
+            self?.coalescing = false
+            self?.enforce()
+        }
+    }
+
+    /// Cheap enough to call on a timer: one property read, and it bails before
+    /// enumerating devices in the common case where nothing is wrong.
+    func enforce() {
+        guard let want = preferredInput() else { return }   // following macOS by choice
+        if let now = defaultInputDeviceID(),
+           let name: CFString = deviceProperty(now, kAudioObjectPropertyName, "" as CFString),
+           nameMatches(want, name as String) {
+            return                                          // already on the right mic
+        }
+        guard let target = inputDevices().first(where: { nameMatches(want, $0.name) }) else {
+            // Unplugged. Don't fight macOS over a device that isn't there — it
+            // would leave no working input at all.
+            if reportedMissing != want {
+                reportedMissing = want
+                guardLog("preferred '\(want)' not connected — leaving the current input alone")
+            }
+            return
+        }
+        reportedMissing = nil
+        guard defaultInputDeviceID() != target.id else { return }   // already correct
+        guard setDefaultInputDevice(target.id) else {
+            guardLog("could not restore '\(target.name)'")
+            return
+        }
+        guardLog("input drifted away from '\(target.name)' — restored it")
+        restartRecorderIfIdle()
+    }
+}
+
 // ── Language of the pasted text ──────────────────────────────────────────────
 // dictate.py reads this on every dictation, so a change takes effect on the very
 // next hold and nothing needs restarting.
@@ -193,6 +292,17 @@ func nameMatches(_ stored: String, _ device: String) -> Bool {
 
 /// The recorder reads the pin once at startup, so a change only takes effect
 /// after a restart. kickstart -k does both halves atomically.
+/// Restart only between dictations: cutting the recorder off mid-hold would lose
+/// whatever is being spoken right now. The flag is what Karabiner touches while
+/// the Globe key is held.
+func restartRecorderIfIdle() {
+    if FileManager.default.fileExists(atPath: "/tmp/rewrite_record_start") {
+        guardLog("hold in progress — not restarting the recorder")
+        return
+    }
+    restartRecorder()
+}
+
 func restartRecorder() {
     let p = Process()
     p.executableURL = URL(fileURLWithPath: "/bin/launchctl")
@@ -242,10 +352,18 @@ class StatusController: NSObject, NSMenuDelegate {
         menu.delegate = self
         rebuildMenu()
 
+        // Keep the chosen microphone selected across device changes.
+        InputGuard.shared.install()
+
         // Poll for playback so the icon reflects it. Cheap: a stat + a signal-0
         // liveness check once a second, and the icon is only redrawn on change.
         iconTimer = Timer.scheduledTimer(withTimeInterval: 1.0, repeats: true) { [weak self] _ in
             self?.refreshIcon()
+            // Belt and braces alongside the CoreAudio listeners: a notification
+            // that never arrives would otherwise leave the wrong mic selected
+            // until the next device event, and the check costs one property read
+            // when nothing has changed.
+            InputGuard.shared.enforce()
         }
         if let t = iconTimer { RunLoop.main.add(t, forMode: .common) }
     }
@@ -294,29 +412,57 @@ class StatusController: NSObject, NSMenuDelegate {
         // ── Microphone ───────────────────────────────────────────────────────
         // Titled with the live input, so the current mic is readable without
         // opening the submenu.
-        let devices  = inputDevices()
+        let devices   = inputDevices()
         let currentID = defaultInputDeviceID()
-        let inUse = devices.first { $0.id == currentID }?.name
+        let inUse     = devices.first { $0.id == currentID }?.name
+        let preferred = preferredInput()
 
         let micRoot = NSMenuItem(title: "Microphone: \(inUse ?? "unknown")",
                                  action: nil, keyEquivalent: "")
         let micMenu = NSMenu()
 
         for dev in devices {
-            let item = NSMenuItem(title: dev.isBluetooth ? "\(dev.name)  · Bluetooth" : dev.name,
+            var title = dev.isBluetooth ? "\(dev.name)  · Bluetooth" : dev.name
+            // Worth saying when the remembered mic is the one being used anyway,
+            // versus remembered but currently overridden.
+            if preferred.map({ nameMatches($0, dev.name) }) == true, dev.id != currentID {
+                title += "  (restoring…)"
+            }
+            let item = NSMenuItem(title: title,
                                   action: #selector(pickInput(_:)), keyEquivalent: "")
             item.target = self
-            item.representedObject = NSNumber(value: dev.id)
-            item.state = (dev.id == currentID) ? .on : .off
+            item.representedObject = dev.name
+            item.state = preferred.map { nameMatches($0, dev.name) } ?? (dev.id == currentID)
+                         ? .on : .off
             item.toolTip = dev.isBluetooth
                 ? "Opening a Bluetooth mic drops the headset to mono call mode: it "
                 + "delays the start of recording and degrades whatever you're listening to."
-                : "Record from this input."
+                : "Always record from this input."
             micMenu.addItem(item)
         }
 
+        // A remembered mic that is unplugged still belongs in the list — otherwise
+        // it looks as though the choice was forgotten.
+        if let want = preferred, !devices.contains(where: { nameMatches(want, $0.name) }) {
+            let missing = NSMenuItem(title: "\(want)  (not connected)", action: nil, keyEquivalent: "")
+            missing.state = .on
+            missing.isEnabled = false
+            micMenu.addItem(missing)
+        }
+
         micMenu.addItem(NSMenuItem.separator())
-        let note = NSMenuItem(title: "Sets the macOS input device", action: nil, keyEquivalent: "")
+        let follow = NSMenuItem(title: "Follow macOS",
+                                action: #selector(followSystemInput), keyEquivalent: "")
+        follow.target = self
+        follow.state = (preferred == nil) ? .on : .off
+        follow.toolTip = "Stop remembering a microphone; use whatever macOS selects."
+        micMenu.addItem(follow)
+
+        micMenu.addItem(NSMenuItem.separator())
+        let note = NSMenuItem(title: preferred == nil
+                                ? "Sets the macOS input device"
+                                : "Kept selected when devices change",
+                              action: nil, keyEquivalent: "")
         note.isEnabled = false
         micMenu.addItem(note)
 
@@ -463,13 +609,24 @@ class StatusController: NSObject, NSMenuDelegate {
     /// recorder so its engine is built against the new device — it reads the
     /// input once at startup, and a running engine does not survive the change.
     @objc func pickInput(_ sender: NSMenuItem) {
-        guard let boxed = sender.representedObject as? NSNumber else { return }
-        guard setDefaultInputDevice(AudioDeviceID(boxed.uint32Value)) else { return }
+        guard let name = sender.representedObject as? String else { return }
+        guard let dev = inputDevices().first(where: { $0.name == name }) else { return }
+
+        // Remember it first: macOS will hand the input to the next headset that
+        // connects, and InputGuard uses this to take it back.
+        setPreferredInput(dev.name)
+        guard setDefaultInputDevice(dev.id) else { return }
+
         // Any leftover pin would poison the engine on the next start; the picker
         // no longer writes one, but an older install may have left one behind.
         try? FileManager.default.removeItem(atPath: inputDeviceFile)
         try? FileManager.default.removeItem(atPath: actualInputFile)
         restartRecorder()
+    }
+
+    /// Stop pinning a choice and let macOS pick, leaving the current input as is.
+    @objc func followSystemInput() {
+        setPreferredInput(nil)
     }
 
     /// Takes effect on the next dictation — dictate.py re-reads the setting each

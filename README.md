@@ -60,7 +60,8 @@ mouse button — for:
 - **Recent** — the last 8 dictations and rewrites, newest first. Click one to copy
   it, so anything that landed in the wrong window is recoverable without opening
   the file. ⌘C still copies the newest.
-- **Microphone** — pick the input the recorder uses (see below).
+- **Microphone** — pick the input the recorder uses, and keep it selected when
+  other devices connect (see below).
 - **Language** — whether dictation is pasted in **English** (translated) or
   **Russian** (exactly what you said, just tidied). Applies from the next hold;
   nothing restarts. A voice command still overrides it for one dictation.
@@ -166,9 +167,18 @@ onto them.
 > and write the config file for you. It should suggest your built-in mic.
 
 **Use the menubar icon → Microphone.** It lists every input, marks Bluetooth
-ones, and checkmarks the one in use. Picking an entry **changes the macOS input
+ones, and checkmarks the one you chose. Picking an entry **changes the macOS input
 device** — the same setting as System Settings → Sound → Input — and restarts the
 recorder so it picks the change up.
+
+The choice is then **kept**. macOS hands the input to whatever connects next, so
+plugging in wireless headphones silently replaces the mic you picked. Echo
+remembers your choice by name and puts it back, within about a second, whether
+the change came from a device connecting or from anywhere else. Two things it
+deliberately won't do: fight over a device that isn't plugged in — it leaves
+whatever macOS chose, so you're never left without a working input — and restart
+the recorder while you're mid-hold. **Follow macOS** in the same menu turns the
+remembering off. Decisions are logged to `/tmp/echo_menubar.log`.
 
 It works that way for a reason. Overriding the device on the recorder's own audio
 engine (`kAudioOutputUnitProperty_CurrentDevice`) is the obvious approach and it
