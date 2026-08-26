@@ -29,6 +29,9 @@ READY_FLAG  = "/tmp/rewrite_record.ready"
 START_FLAG  = "/tmp/rewrite_record_start"
 TARGET_APP  = "/tmp/rewrite_record_app.txt"
 PASTE_HELPER = os.path.join(SCRIPT_DIR, "paste_helper")
+# Where the finished text is handed to the helper that has been holding the field
+# you started dictating in. Written atomically, so its appearance means complete.
+HANDOFF_PATH = "/tmp/rewrite_paste_handoff.txt"
 
 # ── Which recorder are we paired with? ────────────────────────────────────────
 # True  → record_realtime.app streamed the audio to OpenAI's realtime API during
@@ -419,6 +422,108 @@ def write_clipboard(text: str):
     subprocess.run(["pbcopy"], input=text, text=True)
 
 
+# The helper holding the focused field for this hold, if we managed to start one.
+_focus_capture: subprocess.Popen | None = None
+
+
+# Off by default. The mechanism is proven in principle — the accessibility probe
+# restored focus to the Claude Code input and reported the field writable — but
+# the helper does not yet do it reliably: capture intermittently fails with
+# cannotComplete, and delivery has not been observed to succeed end to end. Until
+# it does, dictation behaves exactly as before. Turn it on with:
+#   echo on > "$HOME/Library/Application Support/Echo/field_paste"
+FIELD_PASTE_FLAG = os.path.expanduser("~/Library/Application Support/Echo/field_paste")
+
+
+def field_paste_enabled() -> bool:
+    try:
+        with open(FIELD_PASTE_FLAG) as f:
+            return f.read().strip().lower() in ("on", "1", "true", "yes")
+    except OSError:
+        return False
+
+
+def start_focus_capture():
+    """Grab the text field being dictated into, for the length of the hold.
+
+    Pasting has always targeted the frontmost APP, so stepping out of the input
+    without leaving the app is invisible to it and the text lands wherever focus
+    now is. The field itself is an accessibility element that cannot be passed
+    between processes and usually has no stable identifier to look up later, so
+    something has to hold the reference from keydown to paste. That is this
+    helper — started here, at hold start, and waited on when the text is ready.
+    """
+    global _focus_capture
+    if not field_paste_enabled() or not os.path.exists(PASTE_HELPER):
+        return
+    try:
+        os.remove(HANDOFF_PATH)          # a handoff left by an abandoned hold
+    except OSError:
+        pass
+    try:
+        _focus_capture = subprocess.Popen(
+            [PASTE_HELPER, "--capture", HANDOFF_PATH],
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+    except Exception as e:
+        log(f"focus capture did not start: {e}")
+
+
+def stop_focus_capture():
+    """Abandoned hold — let go of the field rather than leaving a helper waiting."""
+    global _focus_capture
+    if _focus_capture and _focus_capture.poll() is None:
+        _focus_capture.kill()
+    _focus_capture = None
+
+
+def deliver_to_captured_field(clean: str, t0: float) -> bool:
+    """Put the text back where the hold started. True if it landed there.
+
+    False means fall through to the app-level paste, which is what has always
+    happened — so this can only improve on it, never replace it with nothing.
+    """
+    global _focus_capture
+    proc = _focus_capture
+    if proc is None:
+        return False
+    if proc.poll() is not None:
+        # It gave up at keydown: not a text field, or accessibility refused.
+        why = (proc.stderr.read() or "").strip() if proc.stderr else ""
+        log(f"no field captured ({why or 'helper exited early'}) — app-level paste")
+        return False
+
+    tmp = HANDOFF_PATH + ".tmp"
+    try:
+        with open(tmp, "w") as f:
+            f.write(clean)
+        os.replace(tmp, HANDOFF_PATH)    # atomic: the helper never sees a partial write
+    except OSError as e:
+        log(f"handoff write failed: {e}")
+        stop_focus_capture()
+        return False
+
+    try:
+        rc = proc.wait(timeout=2.5)
+    except subprocess.TimeoutExpired:
+        log("field helper did not answer — app-level paste")
+        stop_focus_capture()
+        return False
+    finally:
+        _focus_capture = None
+
+    if rc == 0:
+        log(f"inserted into the field the hold started in  [+{time.monotonic()-t0:.2f}s]")
+        return True
+    if rc == 4:
+        # Focus is back on the right field but it refused a direct write, so the
+        # Cmd+V below will now land in the right place anyway.
+        log("focus restored to the original field; pasting there")
+        return False
+    why = (proc.stderr.read() or "").strip() if proc.stderr else ""
+    log(f"field paste unavailable ({why or f'exit {rc}'}) — app-level paste")
+    return False
+
+
 def prewarm_paste_helper():
     """Fire paste_helper in --check mode at hold-start so its dyld closure and
     AppKit init are warm by the time we paste on release. The first launch of a
@@ -580,6 +685,12 @@ def _finish_dictation(raw: str, clean: str, t0: float):
     except Exception as e:
         log(f"history write failed: {e}")
 
+    # Straight into the field the hold started in, when that is possible: it goes
+    # to the right place even if focus has moved on, and needs no clipboard at all.
+    if deliver_to_captured_field(clean, t0):
+        log(f"PASTE DONE — total time [+{time.monotonic()-t0:.2f}s]")
+        return
+
     saved = read_clipboard()
     write_clipboard(clean)
 
@@ -725,12 +836,14 @@ def main():
     log("LAUNCH (hold start) — warming up")
     prewarm_paste_helper()      # primary paste path
     prewarm_system_events()     # osascript fallback path
+    start_focus_capture()       # hold the field being dictated into
 
     # Block until release. Timeout is generous because it spans the entire
     # hold; a real hold is seconds, and if nothing arrives the user never
     # actually dictated, so we just exit.
     if not wait_for_release(timeout_s=120.0):
         log("no recording within 120s — exiting")
+        stop_focus_capture()
         return
 
     t0 = time.monotonic()   # ≈ the moment the key was released
