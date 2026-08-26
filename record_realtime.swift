@@ -38,12 +38,23 @@ let readyFlag      = "/tmp/rewrite_record.ready"
 let transcriptPath = "/tmp/rewrite_transcript.txt"
 let logPath        = "/tmp/record_realtime.log"
 
+// One append-mode descriptor, held open, writes serialised by a lock.
+//
+// The previous version re-opened the file per line and seeked to the end, with no
+// lock: concurrent writes from the poll thread, the audio tap and the WebSocket
+// handler interleaved mid-line, producing entries like "igured — using system
+// default". Worse, the fallback branch wrote `atomically: true`, which REPLACES
+// the file, so whole runs of history disappeared. That cost real debugging time —
+// a missing line could mean either the event never happened or its write was
+// lost, which are very different diagnoses.
+let logLock = NSLock()
+let logFD: Int32 = open(logPath, O_WRONLY | O_CREAT | O_APPEND, 0o644)
+
 func log(_ s: String) {
-    let line = "[\(Date())] \(s)\n"
-    if let fh = FileHandle(forWritingAtPath: logPath) {
-        fh.seekToEndOfFile(); fh.write(line.data(using: .utf8)!); fh.closeFile()
-    } else {
-        try? line.write(toFile: logPath, atomically: true, encoding: .utf8)
+    guard let data = "[\(Date())] \(s)\n".data(using: .utf8) else { return }
+    logLock.lock(); defer { logLock.unlock() }
+    if logFD >= 0 {
+        _ = data.withUnsafeBytes { write(logFD, $0.baseAddress, $0.count) }
     }
 }
 
@@ -242,6 +253,23 @@ final class LiveHUD {
     }
 }
 
+// Declared above RealtimeSession, which reads it when a session is built. Top-level
+// globals initialise in source order and the poll thread starts during that init,
+// so a start flag already present at launch can reach this before it exists —
+// the ordering trap that has already caused one crash in this file.
+let delayFile = NSString(string: "~/Library/Application Support/Echo/transcribe_delay")
+                .expandingTildeInPath
+
+/// The configured tier, falling back to the default for anything unrecognised — a
+/// typo in the file must not be able to take dictation down.
+func transcribeDelay() -> String {
+    guard let raw = try? String(contentsOfFile: delayFile, encoding: .utf8) else {
+        return RealtimeSession.defaultDelay
+    }
+    let v = raw.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+    return RealtimeSession.validDelays.contains(v) ? v : RealtimeSession.defaultDelay
+}
+
 // ── Realtime WebSocket session ───────────────────────────────────────────────
 final class RealtimeSession {
     // gpt-live-transcribe streams transcript deltas AS SPEECH ARRIVES, which is
@@ -260,12 +288,16 @@ final class RealtimeSession {
     // into English regardless, so there is nothing for "en" to earn here.
     static let languages = ["ru"]
 
-    // "minimal" or "low" — the only two the API accepts. "minimal" commits tokens
-    // on the least audio, which is what made the opening words come back in the
-    // wrong language; "low" gives the model more to go on before it commits.
-    // Logged with every measurement so a run's numbers say which setting produced
-    // them, rather than having to be matched up against deploy times afterwards.
-    static let delay = "low"
+    // How much audio the model hears before committing tokens. The server names
+    // all five when it rejects a bad one: minimal, low, medium, high, xhigh.
+    // Lower gets text on screen sooner and identifies the language worse — which
+    // is what made the opening words come back as Chinese or English.
+    //
+    // Read per session rather than baked in, so it can be changed from the
+    // menubar and apply to the next hold. Only the speaker can judge this trade.
+    static let validDelays = ["minimal", "low", "medium", "high", "xhigh"]
+    static let defaultDelay = "low"
+    let delay = transcribeDelay()
 
     // Told to the model as context, which is why this string is Russian: it is
     // functional input to an acoustic model, not copy anyone reads. Priming with
@@ -358,7 +390,7 @@ final class RealtimeSession {
                         // because the text we paste comes from the completed
                         // transcript, not this stream — a rougher live preview
                         // costs us nothing.
-                        "delay": Self.delay,
+                        "delay": delay,
                     ],
                     // No turn_detection here: gpt-live-transcribe rejects it.
                 ]],
@@ -497,7 +529,7 @@ final class RealtimeSession {
             lock.unlock()
             if isFirstText {
                 let ms = Int(-recordingStartedAt.timeIntervalSinceNow * 1000)
-                log("caption: first text \(ms)ms after press (delay: \(Self.delay))")
+                log("caption: first text \(ms)ms after press (delay: \(delay))")
             }
             if isBreak { log(String(format: "caption: pause %.2fs → break", gap)) }
             LiveHUD.shared.update(live)
@@ -634,6 +666,39 @@ func availableInputNames() -> [String] {
 // waits on this: changing the input device while the engine is being configured
 // invalidates its format, which showed up as a -10868 FormatNotSupported and a
 // tap that delivered 0 bytes — the HUD appeared but nothing was ever heard.
+// A hang while opening the audio graph needs its own guard.
+//
+// `engine.inputNode` can block indefinitely when CoreAudio is wedged. It happens
+// on the poll thread, so the whole flag loop stops: no recording, no error, no
+// further holds, and the zero-capture watchdog below never fires because it counts
+// COMPLETED recordings and a hang never completes one. Dictation just stops, which
+// is exactly the silent failure this recorder is supposed to have stopped having.
+//
+// So bound it. If a hold hasn't got the engine running shortly after the key went
+// down, say so and exit: launchd supplies a clean process, which cures a wedge
+// confined to this one. A wedge in CoreAudio itself will hang the next process
+// too — the repeated log lines are then the diagnosis, and the cure is restarting
+// coreaudiod, which no amount of restarting this daemon can substitute for.
+let engineWatchLock = NSLock()
+var engineStartSeq = 0
+var engineStartDone = 0
+
+func beginEngineWatch() -> Int {
+    engineWatchLock.lock(); defer { engineWatchLock.unlock() }
+    engineStartSeq += 1
+    return engineStartSeq
+}
+
+func finishEngineWatch(_ seq: Int) {
+    engineWatchLock.lock(); defer { engineWatchLock.unlock() }
+    engineStartDone = max(engineStartDone, seq)
+}
+
+func engineWatchPending(_ seq: Int) -> Bool {
+    engineWatchLock.lock(); defer { engineWatchLock.unlock() }
+    return engineStartDone < seq
+}
+
 // Self-healing. Every way this recorder has broken looks the same from outside:
 // the process is alive and responsive, the flags still work, and every recording
 // captures zero bytes — a wedged CoreAudio graph, a device that vanished, an
@@ -716,6 +781,19 @@ func startRecording() {
     sentBytes = 0
     stateLock.unlock()
 
+    log("hold: start")   // everything below has hung at least once; mark the phases
+
+    // Watch this attempt: if the engine isn't running shortly, the graph is stuck
+    // and only a fresh process can help.
+    let watch = beginEngineWatch()
+    DispatchQueue.global(qos: .utility).asyncAfter(deadline: .now() + 8.0) {
+        guard engineWatchPending(watch) else { return }
+        log("AUDIO STUCK: the engine did not start within 8s of the key going down.")
+        log("Exiting for a clean recorder. If this repeats, CoreAudio itself is wedged —")
+        log("reset it with: sudo launchctl kickstart -k system/com.apple.audio.coreaudiod")
+        exit(1)
+    }
+
     try? FileManager.default.removeItem(atPath: readyFlag)
     try? FileManager.default.removeItem(atPath: transcriptPath)
 
@@ -742,6 +820,7 @@ func startRecording() {
     }
     pinSettled.signal()   // keep it available for later recordings
 
+    log("hold: session opened, reading the input")
     let input = engine.inputNode
     let nodeFormat = input.outputFormat(forBus: 0)
 
@@ -749,6 +828,7 @@ func startRecording() {
     // engine is another way to die. Skip the recording instead, and still raise
     // the ready flag so dictate.py doesn't wait for a handoff that never comes.
     guard nodeFormat.sampleRate > 0, nodeFormat.channelCount > 0 else {
+        finishEngineWatch(watch)
         log("input not ready (\(nodeFormat.sampleRate)Hz, \(nodeFormat.channelCount)ch) — skipping this recording")
         stateLock.lock(); isRecording = false; stateLock.unlock()
         LiveHUD.shared.hide()
@@ -796,9 +876,11 @@ func startRecording() {
     do {
         try engine.start()
         let ms = Int(Date().timeIntervalSince(pressedAt) * 1000)
-        log("recording started (in: \(nodeFormat.sampleRate)Hz, \(ms)ms after press)")
+        finishEngineWatch(watch)
+        log("recording started (in: \(nodeFormat.sampleRate)Hz, delay: \(s.delay), \(ms)ms after press)")
     }
     catch {
+        finishEngineWatch(watch)
         log("engine start failed: \(error)")
 
         // -10868 (FormatNotSupported) here means an input pin is configured.

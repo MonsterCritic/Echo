@@ -164,6 +164,34 @@ func setPastedLanguage(_ code: String) {
     try? (code + "\n").write(toFile: outputLangFile, atomically: true, encoding: .utf8)
 }
 
+// ── How long the transcriber listens before committing ───────────────────────
+// The five tiers the API accepts. Lower gets text on screen sooner; higher gives
+// the model more audio before it commits, which is what decides whether the
+// opening words come out in the right language. record_realtime reads this at the
+// start of each dictation, so a change applies to the next hold.
+let delayFile = NSString(string: "~/Library/Application Support/Echo/transcribe_delay")
+                .expandingTildeInPath
+let delayTiers = [
+    ("minimal", "Minimal — text soonest"),
+    ("low",     "Low"),
+    ("medium",  "Medium"),
+    ("high",    "High"),
+    ("xhigh",   "Extra high — most accurate"),
+]
+let defaultDelayTier = "low"
+
+func transcribeDelay() -> String {
+    guard let raw = try? String(contentsOfFile: delayFile, encoding: .utf8) else { return defaultDelayTier }
+    let v = raw.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+    return delayTiers.contains(where: { $0.0 == v }) ? v : defaultDelayTier
+}
+
+func setTranscribeDelay(_ tier: String) {
+    let dir = (delayFile as NSString).deletingLastPathComponent
+    try? FileManager.default.createDirectory(atPath: dir, withIntermediateDirectories: true)
+    try? (tier + "\n").write(toFile: delayFile, atomically: true, encoding: .utf8)
+}
+
 func trimmedContents(of path: String) -> String? {
     guard let s = try? String(contentsOfFile: path, encoding: .utf8) else { return nil }
     let t = s.trimmingCharacters(in: .whitespacesAndNewlines)
@@ -492,6 +520,29 @@ class StatusController: NSObject, NSMenuDelegate {
 
         langRoot.submenu = langMenu
         menu.addItem(langRoot)
+
+        // ── Recognition delay ────────────────────────────────────────────────
+        let tier = transcribeDelay()
+        let delayRoot = NSMenuItem(title: "Recognition delay: \(tier)",
+                                   action: nil, keyEquivalent: "")
+        let delayMenu = NSMenu()
+        for (code, title) in delayTiers {
+            let item = NSMenuItem(title: title, action: #selector(pickDelay(_:)), keyEquivalent: "")
+            item.target = self
+            item.representedObject = code
+            item.state = (code == tier) ? .on : .off
+            item.toolTip = "How much speech the model hears before it commits words. "
+                         + "Lower shows text sooner; higher identifies the language better."
+            delayMenu.addItem(item)
+        }
+        delayMenu.addItem(NSMenuItem.separator())
+        let delayNote = NSMenuItem(title: "Applies to the next dictation",
+                                   action: nil, keyEquivalent: "")
+        delayNote.isEnabled = false
+        delayMenu.addItem(delayNote)
+
+        delayRoot.submenu = delayMenu
+        menu.addItem(delayRoot)
         menu.addItem(NSMenuItem.separator())
 
         let openItem = NSMenuItem(title: "Open Full History",
@@ -634,6 +685,12 @@ class StatusController: NSObject, NSMenuDelegate {
     @objc func pickLanguage(_ sender: NSMenuItem) {
         guard let code = sender.representedObject as? String else { return }
         setPastedLanguage(code)
+    }
+
+    /// No restart: record_realtime reads the tier when it opens each session.
+    @objc func pickDelay(_ sender: NSMenuItem) {
+        guard let code = sender.representedObject as? String else { return }
+        setTranscribeDelay(code)
     }
 
     /// Open the history file for reading.
