@@ -62,6 +62,32 @@ if !trusted {
 // ── Reading elements ─────────────────────────────────────────────────────────
 let systemWide = AXUIElementCreateSystemWide()
 
+// Asking the system-wide element for the focused field returns cannotComplete
+// against Chromium-based apps — Claude Code, VS Code, Slack, browsers. They keep
+// their accessibility tree switched off until an assistive client asks for it,
+// and the switch is a private attribute set on the application element:
+// AXManualAccessibility. Without this the probe reads nothing from precisely the
+// apps that matter, which is not the same as those apps having nothing to read.
+//
+// The messaging timeout is raised for the same reason: building that tree the
+// first time is not instant, and the default deadline expires during it.
+var enabledApps = Set<pid_t>()
+
+func appElement(for pid: pid_t) -> AXUIElement {
+    let app = AXUIElementCreateApplication(pid)
+    if !enabledApps.contains(pid) {
+        enabledApps.insert(pid)
+        AXUIElementSetMessagingTimeout(app, 2.0)
+        AXUIElementSetAttributeValue(app, "AXManualAccessibility" as CFString, kCFBooleanTrue)
+    }
+    return app
+}
+
+func frontmostAppElement() -> AXUIElement? {
+    guard let pid = NSWorkspace.shared.frontmostApplication?.processIdentifier else { return nil }
+    return appElement(for: pid)
+}
+
 func attr(_ el: AXUIElement, _ name: String) -> CFTypeRef? {
     var v: CFTypeRef?
     guard AXUIElementCopyAttributeValue(el, name as CFString, &v) == .success else { return nil }
@@ -83,6 +109,14 @@ func settable(_ el: AXUIElement, _ name: String) -> Bool {
 var lastFocusError: AXError = .success
 
 func focusedElement() -> AXUIElement? {
+    // Ask the frontmost application directly — it answers when the system-wide
+    // element will not, and asking is what turns the tree on in the first place.
+    if let app = frontmostAppElement() {
+        var v: CFTypeRef?
+        lastFocusError = AXUIElementCopyAttributeValue(
+            app, kAXFocusedUIElementAttribute as CFString, &v)
+        if lastFocusError == .success, let v = v { return (v as! AXUIElement) }
+    }
     var v: CFTypeRef?
     lastFocusError = AXUIElementCopyAttributeValue(
         systemWide, kAXFocusedUIElementAttribute as CFString, &v)
@@ -215,14 +249,20 @@ if args.contains("--restore") {
     exit(0)
 }
 
-// Default: watch.
+// Default: watch. Stops early once it has seen enough distinct fields, so it
+// waits for the person rather than making them race a timer — the first run of
+// this collected nothing because the window closed before anyone clicked.
 let seconds = value(after: "--watch", default: 20)
-print("Watching the focused field for \(Int(seconds))s — click through the inputs you dictate into.")
+let wantFields = Int(value(after: "--until", default: 0))
+print("Watching the focused field for up to \(Int(seconds))s"
+      + (wantFields > 0 ? ", or until \(wantFields) different fields have been seen." : "."))
+print("Click through the inputs you dictate into.")
 print("(field contents are never printed, only their length)\n")
 
 var last: Fingerprint?
 var lastNote = ""
 var seenAny = false
+var distinct = 0
 let deadline = Date().addingTimeInterval(seconds)
 while Date() < deadline {
     if let el = focusedElement() {
@@ -230,6 +270,7 @@ while Date() < deadline {
         if fp != last {
             last = fp
             seenAny = true
+            distinct += 1
             print("• \(fp.line)")
             print("    \(writability(el))")
             print("    findable from stored attributes: \(fp.isIdentifiable ? "yes" : "NO — live reference only")")
@@ -238,6 +279,8 @@ while Date() < deadline {
         let note = "(\(NSWorkspace.shared.frontmostApplication?.localizedName ?? "?")) \(focusErrorText())"
         if note != lastNote { lastNote = note; print("· \(note)") }
     }
+    if wantFields > 0 && distinct >= wantFields { break }
     Thread.sleep(forTimeInterval: 0.4)
 }
-print(seenAny ? "\ndone." : "\ndone — nothing was focused the whole time. Click into a text field while this runs.")
+print(seenAny ? "\ndone — \(distinct) field(s) seen."
+              : "\ndone — nothing was focused the whole time. Click into a text field while this runs.")
