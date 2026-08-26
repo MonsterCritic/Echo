@@ -260,6 +260,13 @@ final class RealtimeSession {
     // into English regardless, so there is nothing for "en" to earn here.
     static let languages = ["ru"]
 
+    // "minimal" or "low" — the only two the API accepts. "minimal" commits tokens
+    // on the least audio, which is what made the opening words come back in the
+    // wrong language; "low" gives the model more to go on before it commits.
+    // Logged with every measurement so a run's numbers say which setting produced
+    // them, rather than having to be matched up against deploy times afterwards.
+    static let delay = "low"
+
     // Told to the model as context, which is why this string is Russian: it is
     // functional input to an acoustic model, not copy anyone reads. Priming with
     // Russian text is what stops the opening words being decoded as some other
@@ -351,7 +358,7 @@ final class RealtimeSession {
                         // because the text we paste comes from the completed
                         // transcript, not this stream — a rougher live preview
                         // costs us nothing.
-                        "delay": "minimal",
+                        "delay": Self.delay,
                     ],
                     // No turn_detection here: gpt-live-transcribe rejects it.
                 ]],
@@ -490,7 +497,7 @@ final class RealtimeSession {
             lock.unlock()
             if isFirstText {
                 let ms = Int(-recordingStartedAt.timeIntervalSinceNow * 1000)
-                log("caption: first text \(ms)ms after press")
+                log("caption: first text \(ms)ms after press (delay: \(Self.delay))")
             }
             if isBreak { log(String(format: "caption: pause %.2fs → break", gap)) }
             LiveHUD.shared.update(live)
