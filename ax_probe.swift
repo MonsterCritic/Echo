@@ -83,9 +83,26 @@ func appElement(for pid: pid_t) -> AXUIElement {
     return app
 }
 
+/// Which app is frontmost, asked of the accessibility layer rather than
+/// NSWorkspace. NSWorkspace tracks that through notifications delivered on a run
+/// loop, and this tool has none — so `frontmostApplication` stays stuck on
+/// whatever was in front when it launched. A seven-minute run reported one app
+/// the entire time while apps were being switched in front of it.
 func frontmostAppElement() -> AXUIElement? {
-    guard let pid = NSWorkspace.shared.frontmostApplication?.processIdentifier else { return nil }
-    return appElement(for: pid)
+    var v: CFTypeRef?
+    guard AXUIElementCopyAttributeValue(
+            systemWide, kAXFocusedApplicationAttribute as CFString, &v) == .success,
+          let v = v else {
+        // Fall back, accepting that it may be stale, rather than reading nothing.
+        guard let pid = NSWorkspace.shared.frontmostApplication?.processIdentifier else { return nil }
+        return appElement(for: pid)
+    }
+    let app = v as! AXUIElement
+    var pid: pid_t = 0
+    if AXUIElementGetPid(app, &pid) == .success, !enabledApps.contains(pid) {
+        _ = appElement(for: pid)      // switch its tree on, once
+    }
+    return app
 }
 
 func attr(_ el: AXUIElement, _ name: String) -> CFTypeRef? {
@@ -213,18 +230,36 @@ func value(after flag: String, default d: Double) -> Double {
 }
 
 if args.contains("--restore") {
-    let wait = value(after: "--restore", default: 8)
-    guard let saved = focusedElement() else {
-        print("Nothing is focused. Click into a text field first, then run this again.")
+    let wait = value(after: "--restore", default: 90)
+
+    // Wait for a field to be focused rather than demanding one already is, and
+    // then wait for focus to actually move rather than counting down a fixed
+    // sleep. The point is to test what happens when the person clicks away, and
+    // making them hit a timer they cannot see just measures their reflexes.
+    print("Click into the input you'd start dictating in… (up to \(Int(wait))s)\n")
+    var saved: AXUIElement?
+    let armDeadline = Date().addingTimeInterval(wait)
+    while Date() < armDeadline {
+        if let el = focusedElement(), (str(el, kAXRoleAttribute as String) ?? "").contains("Text") {
+            saved = el
+            break
+        }
+        Thread.sleep(forTimeInterval: 0.3)
+    }
+    guard let saved = saved else {
+        print("No text field was focused in time.")
         exit(1)
     }
     let savedPrint = fingerprint(saved)
     print("captured:  \(savedPrint.line)")
     print("           \(writability(saved))")
     print("           findable from stored attributes: \(savedPrint.isIdentifiable ? "yes" : "NO — only a live reference)")")
-    print("\nnow click into a DIFFERENT field or app. restoring in \(Int(wait))s…\n")
-    Thread.sleep(forTimeInterval: wait)
-
+    print("\nnow click somewhere else — another field, or another app…\n")
+    let driftDeadline = Date().addingTimeInterval(wait)
+    while Date() < driftDeadline {
+        if let now = focusedElement(), !CFEqual(now, saved) { break }
+        Thread.sleep(forTimeInterval: 0.3)
+    }
     let drifted = focusedElement().map { fingerprint($0) }
     print("focus drifted to: \(drifted?.line ?? "(nothing)")")
 
@@ -276,7 +311,10 @@ while Date() < deadline {
             print("    findable from stored attributes: \(fp.isIdentifiable ? "yes" : "NO — live reference only")")
         }
     } else {
-        let note = "(\(NSWorkspace.shared.frontmostApplication?.localizedName ?? "?")) \(focusErrorText())"
+        var pid: pid_t = 0
+        if let app = frontmostAppElement() { AXUIElementGetPid(app, &pid) }
+        let name = NSRunningApplication(processIdentifier: pid)?.localizedName ?? "?"
+        let note = "(\(name)) \(focusErrorText())"
         if note != lastNote { lastNote = note; print("· \(note)") }
     }
     if wantFields > 0 && distinct >= wantFields { break }
