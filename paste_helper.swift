@@ -32,13 +32,13 @@ import CoreGraphics
 // neither an id nor a label). So one process has to capture at hold start and
 // still be alive at paste time — which is what this mode is: launched when the
 // key goes down, it waits for the text and then puts it where the hold began.
-let systemWide: AXUIElement = {
-    let el = AXUIElementCreateSystemWide()
-    // Chromium apps take a moment to answer the first time their tree is built,
-    // and the default deadline expires inside that.
-    AXUIElementSetMessagingTimeout(el, 2.0)
-    return el
-}()
+// Deliberately left on the default timeout. Calling AXUIElementSetMessagingTimeout
+// on the SYSTEM-WIDE element sets a global default for every element in the
+// process, and doing so here made every query fail with cannotComplete — no
+// focused element could be read from any app at all, for four seconds at a
+// stretch, while the same code without it answers immediately. Per-application
+// elements get their timeout raised individually in enableAX.
+let systemWide = AXUIElementCreateSystemWide()
 var axEnabled = Set<pid_t>()
 
 func axAttr(_ el: AXUIElement, _ name: String) -> CFTypeRef? {
@@ -173,6 +173,51 @@ let trusted: Bool = {
 if checkOnly || grantMode {
     print(trusted ? "TRUSTED" : "NOT_TRUSTED")
     exit(trusted ? 0 : 2)
+}
+
+// --focus-kind: is a text field focused right now?
+//   prints TEXT / NOT_TEXT:<role> / UNKNOWN, and exits 0 / 1 / 2 respectively.
+//
+// Used to decide whether pasting is safe. If the caller pastes while no text
+// field has focus, the keystroke goes wherever it lands — into a page, a canvas,
+// or a shortcut — and the dictation is simply gone. UNKNOWN is deliberately its
+// own answer rather than being folded into NOT_TEXT: not knowing is not the same
+// as knowing there is nowhere to type, and the caller should carry on as before
+// rather than change behaviour on a failed reading.
+if args.contains("--focus-kind") {
+    guard trusted else { print("UNKNOWN"); exit(2) }
+    primeFrontmostApp()
+
+    // Short budget: this sits on the paste path, and a slow answer costs the user
+    // more than a missing one. The tree is primed at hold start, so by now it is
+    // usually warm.
+    var role: String?
+    var budget = 0.5
+    if let i = args.firstIndex(of: "--focus-kind"), i + 1 < args.count,
+       let v = Double(args[i + 1]) { budget = v }
+    let deadline = Date().addingTimeInterval(budget)
+    repeat {
+        if let el = focusedElement(),
+           let r = axAttr(el, kAXRoleAttribute as String) as? String {
+            role = r
+            break
+        }
+        usleep(60_000)
+    } while Date() < deadline
+
+    guard let role = role else {
+        print("UNKNOWN")
+        FileHandle.standardError.write(
+            "stage=\(lastAXStage) AXError=\(lastAXError.rawValue) trusted=\(trusted)\n"
+                .data(using: .utf8)!)
+        exit(2)
+    }
+    if role.contains("Text") || role == (kAXComboBoxRole as String) {
+        print("TEXT")
+        exit(0)
+    }
+    print("NOT_TEXT:\(role)")
+    exit(1)
 }
 
 // --capture <handoff-path>: hold the focused field, then place the text in it.

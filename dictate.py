@@ -524,6 +524,42 @@ def deliver_to_captured_field(clean: str, t0: float) -> bool:
     return False
 
 
+def notify(title: str, message: str):
+    """A quiet heads-up. Without one, diverting to the clipboard would look
+    exactly like dictation having failed."""
+    try:
+        subprocess.run(
+            ["osascript", "-e",
+             f'display notification {json.dumps(message)} with title {json.dumps(title)}'],
+            capture_output=True, timeout=3)
+    except Exception:
+        pass
+
+
+def focused_field_kind() -> str:
+    """"TEXT", "NOT_TEXT:<role>", or "UNKNOWN" for the field focused right now.
+
+    UNKNOWN is not a synonym for NOT_TEXT: the accessibility layer on this machine
+    intermittently answers nothing at all, and treating that as "nowhere to type"
+    would stop pasting for no reason. Only a confident answer changes behaviour.
+    """
+    if not os.path.exists(PASTE_HELPER):
+        return "UNKNOWN"
+    try:
+        # Small budget: this is on the paste path. A healthy accessibility layer
+        # answers in milliseconds; a sick one must not add a visible delay.
+        r = subprocess.run([PASTE_HELPER, "--focus-kind", "0.35"],
+                           capture_output=True, text=True, timeout=2.0)
+        out = (r.stdout or "").strip()
+        if out.startswith("TEXT"):
+            return "TEXT"
+        if out.startswith("NOT_TEXT"):
+            return out
+    except Exception as e:
+        log(f"focus check failed: {e}")
+    return "UNKNOWN"
+
+
 def prewarm_paste_helper():
     """Fire paste_helper in --check mode at hold-start so its dyld closure and
     AppKit init are warm by the time we paste on release. The first launch of a
@@ -689,6 +725,17 @@ def _finish_dictation(raw: str, clean: str, t0: float):
     # to the right place even if focus has moved on, and needs no clipboard at all.
     if deliver_to_captured_field(clean, t0):
         log(f"PASTE DONE — total time [+{time.monotonic()-t0:.2f}s]")
+        return
+
+    # Nowhere to type: don't paste. Cmd+V with no text field focused sends the
+    # keystroke into a page, a canvas or a shortcut, and the dictation is gone.
+    # Leaving it on the clipboard costs one Cmd+V and cannot lose anything.
+    kind = focused_field_kind()
+    if kind.startswith("NOT_TEXT"):
+        write_clipboard(clean)
+        log(f"no text field focused ({kind}) — left on the clipboard  "
+            f"[+{time.monotonic()-t0:.2f}s]")
+        notify("Dictation copied", "No text field was focused — press Cmd+V where you want it.")
         return
 
     saved = read_clipboard()
