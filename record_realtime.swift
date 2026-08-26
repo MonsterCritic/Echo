@@ -260,6 +260,22 @@ final class RealtimeSession {
     // into English regardless, so there is nothing for "en" to earn here.
     static let languages = ["ru"]
 
+    // Told to the model as context, which is why this string is Russian: it is
+    // functional input to an acoustic model, not copy anyone reads. Priming with
+    // Russian text is what stops the opening words being decoded as some other
+    // language — "languages" turns out to be a hint list the model can still
+    // depart from, confirmed by asking the server what it applied: it reports
+    // languages ["ru"] and a separate, unused prompt field. With delay "minimal"
+    // the model commits tokens before it has heard enough to identify the
+    // language, so the first word or two came back as Chinese, English or
+    // nonsense. The domain words are here for the same reason — they are the
+    // vocabulary actually being dictated, so the model reaches for them instead
+    // of inventing look-alikes.
+    static let prompt = "Транскрибируй речь только на русском языке. "
+                      + "Не переключайся на другие языки. Тематика — "
+                      + "веб-интерфейсы: инпут, кнопка, дропдаун, домен, "
+                      + "воркспейс, мобильная версия, иконка в меню."
+
     private let ws: URLSessionWebSocketTask
     private let lock = NSLock()
     private var configured = false
@@ -330,6 +346,7 @@ final class RealtimeSession {
                         // en are listed because dictation mixes them ("localhost",
                         // "restore").
                         "languages": Self.languages,
+                        "prompt": Self.prompt,
                         // Lowest latency, so words appear as they're spoken. Safe
                         // because the text we paste comes from the completed
                         // transcript, not this stream — a rougher live preview
@@ -450,6 +467,12 @@ final class RealtimeSession {
             let d = obj["delta"] as? String ?? ""
             if d.isEmpty { return }
             lock.lock()
+            // Time to the first caption text. This is the number that matters when
+            // weighing `delay`: "minimal" commits tokens on very little audio,
+            // which is why the opening words can be decoded as the wrong language,
+            // and "low" (the only other accepted value) trades some of this
+            // latency for more evidence before committing.
+            let isFirstText = lastDeltaAt == nil
             var gap = 0.0
             if let last = lastDeltaAt { gap = -last.timeIntervalSinceNow }
             let isBreak = lastDeltaAt != nil && gap >= Self.pauseBreakSeconds
@@ -465,6 +488,10 @@ final class RealtimeSession {
             lastActivity = Date()
             let live = deltaText
             lock.unlock()
+            if isFirstText {
+                let ms = Int(-recordingStartedAt.timeIntervalSinceNow * 1000)
+                log("caption: first text \(ms)ms after press")
+            }
             if isBreak { log(String(format: "caption: pause %.2fs → break", gap)) }
             LiveHUD.shared.update(live)
         case "error":
