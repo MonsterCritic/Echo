@@ -106,6 +106,11 @@ final class LiveHUD {
     private var currentHeight: CGFloat = 0
     private let padX: CGFloat = 18
     private let padY: CGFloat = 12
+    // A strip along the top for the language badge. Reserved rather than overlaid,
+    // so a long caption can never run underneath it.
+    private let badgeH: CGFloat = 18
+    private var badge: NSTextField?
+    private var badgeTimer: Timer?
     private let bottomInset: CGFloat = 90
 
     private func build() {
@@ -131,7 +136,7 @@ final class LiveHUD {
 
         let tf = NSTextField(frame: NSRect(x: padX, y: padY,
                                           width: width - padX * 2,
-                                          height: minHeight - padY * 2))
+                                          height: minHeight - padY * 2 - badgeH))
         tf.isEditable = false
         tf.isSelectable = false
         tf.isBordered = false
@@ -147,11 +152,36 @@ final class LiveHUD {
         tf.alignment = .left
         tf.autoresizingMask = [.width, .height]
 
+        // Which language this dictation will be pasted in. Worth showing while
+        // speaking: the setting can be flipped mid-hold with Globe + Space, and
+        // otherwise the only way to find out which way it went is to finish the
+        // sentence and see what language comes back.
+        let bd = NSTextField(labelWithString: "")
+        bd.frame = NSRect(x: padX, y: minHeight - padY / 2 - badgeH,
+                          width: width - padX * 2, height: badgeH)
+        bd.font = .systemFont(ofSize: 11, weight: .semibold)
+        bd.textColor = NSColor.labelColor.withAlphaComponent(0.45)
+        bd.alignment = .right
+        bd.drawsBackground = false
+        bd.autoresizingMask = [.width, .minYMargin]   // stays at the top as it grows
+
         bg.addSubview(tf)
+        bg.addSubview(bd)
         w.contentView = bg
         window = w
         label = tf
+        badge = bd
         bgView = bg
+    }
+
+    /// Read fresh each time — dictate.py reads the same file per dictation, so
+    /// what the badge says is exactly what will be pasted.
+    private func refreshBadge() {
+        let path = NSString(string: "~/Library/Application Support/Echo/output_language")
+                   .expandingTildeInPath
+        let raw = (try? String(contentsOfFile: path, encoding: .utf8)) ?? ""
+        let ru = raw.trimmingCharacters(in: .whitespacesAndNewlines).lowercased().hasPrefix("ru")
+        badge?.stringValue = ru ? "→ RUSSIAN" : "→ ENGLISH"
     }
 
     /// Height `text` needs at our fixed width, measured with the field's own cell
@@ -188,6 +218,15 @@ final class LiveHUD {
         DispatchQueue.main.async {
             if self.window == nil { self.build() }
             self.label?.stringValue = "Listening…"
+            self.refreshBadge()
+            // Poll while visible: the language can change mid-hold and there is no
+            // notification to hang this off.
+            self.badgeTimer?.invalidate()
+            let t = Timer.scheduledTimer(withTimeInterval: 0.25, repeats: true) { [weak self] _ in
+                self?.refreshBadge()
+            }
+            RunLoop.main.add(t, forMode: .common)
+            self.badgeTimer = t
             self.pendingText = nil
             self.currentHeight = self.minHeight
             self.reposition(height: self.minHeight)
@@ -225,7 +264,7 @@ final class LiveHUD {
         let t = raw.trimmingCharacters(in: .whitespacesAndNewlines)
         var display = t.isEmpty ? "Listening…" : t
 
-        let fits = maxHeight - padY * 2
+        let fits = maxHeight - padY * 2 - badgeH
         if heightFor(display) > fits {
             // Binary-search the longest suffix that still fits, so the newest
             // words — what's being spoken right now — stay visible.
@@ -249,7 +288,11 @@ final class LiveHUD {
     }
 
     func hide() {
-        DispatchQueue.main.async { self.window?.orderOut(nil) }
+        DispatchQueue.main.async {
+            self.badgeTimer?.invalidate()
+            self.badgeTimer = nil
+            self.window?.orderOut(nil)
+        }
     }
 }
 

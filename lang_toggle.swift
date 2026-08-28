@@ -40,11 +40,17 @@ let from = currentLanguage()
 let to   = (from == "ru") ? "en" : "ru"
 write(to)
 
-// Globe is also the dictation key: held past 300ms it starts recording. Pressing
-// Space a beat late would otherwise leave a recording running and a dictate.py
-// waiting on it, so clear the flag — the recorder stops on its own and discards
-// the fragment as too short.
-try? FileManager.default.removeItem(atPath: "/tmp/rewrite_record_start")
+// Deliberately does NOT stop an in-progress recording.
+//
+// It used to clear /tmp/rewrite_record_start, on the reasoning that a slow
+// Globe + Space would otherwise leave a stray recording running. But switching
+// language mid-sentence is the main way this gets used — you are already talking
+// when you decide the output should be Russian — and clearing the flag ends the
+// dictation you are in the middle of. The stray-recording case is harmless by
+// comparison: it stops on Globe release and is discarded as too short.
+//
+// The switch reaches an in-flight dictation on its own, because dictate.py reads
+// the setting when it translates, which happens after release.
 
 // ── The HUD ──────────────────────────────────────────────────────────────────
 let app = NSApplication.shared
