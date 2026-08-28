@@ -128,6 +128,10 @@ swiftc -O dialog_buttons.swift -o dialog_buttons
 # paste fast and load-immune. Ad-hoc sign so it can hold an Accessibility grant.
 swiftc -O paste_helper.swift -o paste_helper
 codesign -s - -f paste_helper 2>/dev/null || true
+# lang_toggle flips the dictation language and shows a HUD saying which way it
+# went. It lives in $BIN_DIR because Karabiner runs it by absolute path.
+swiftc -O lang_toggle.swift -o "$BIN_DIR/lang_toggle"
+codesign --force --sign - "$BIN_DIR/lang_toggle" 2>/dev/null || true
 # pcm_play streams raw PCM from stdin so AI Speak can start talking before the
 # whole TTS response has downloaded (afplay needs a complete file).
 swiftc -O pcm_play.swift -o pcm_play
@@ -205,6 +209,16 @@ cat > "$KARABINER_DIR/echo.json" <<EOF
                     "from": { "key_code": "fn", "modifiers": { "mandatory": ["command"] } },
                     "to": [
                         { "shell_command": "/usr/bin/python3 $SCRIPT_DIR/speak.py" }
+                    ]
+                },
+                {
+                    "type": "basic",
+                    "from": {
+                        "key_code": "spacebar",
+                        "modifiers": { "mandatory": ["fn"], "optional": ["any"] }
+                    },
+                    "to": [
+                        { "shell_command": "'$BIN_DIR/lang_toggle' &" }
                     ]
                 }
             ]

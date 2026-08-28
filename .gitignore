@@ -24,3 +24,4 @@ __pycache__/
 *.swp
 record_realtime.app/
 ax_probe
+lang_toggle

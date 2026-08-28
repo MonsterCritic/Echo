@@ -65,6 +65,8 @@ mouse button — for:
 - **Language** — whether dictation is pasted in **English** (translated) or
   **Russian** (exactly what you said, just tidied). Applies from the next hold;
   nothing restarts. A voice command still overrides it for one dictation.
+  **Globe + Space** switches it without opening the menu, showing which way it
+  went the way macOS does when you change input source.
 - **Stop Speaking** — shown only while AI Speak is talking.
 - **Open Full History** — the whole markdown file in your editor.
 
@@ -235,6 +237,8 @@ If a tool misfires, check `~/Documents/context-helper/rewrite.log` — every act
 | `history_menubar.swift` | Menubar app: recent dictations, Stop Speaking, and the Microphone picker |
 | `paste_helper.swift` | Sends Cmd+V / Cmd+C via CGEvent, bypassing System Events |
 | `pcm_play.swift` | Plays raw PCM from stdin so AI Speak starts before the download finishes |
+| `lang_toggle.swift` | Globe + Space: switches the dictation language and shows it on screen |
+| `ax_probe.swift` | Diagnostic: what the accessibility layer exposes for the focused field |
 | `hud.swift`, `dialog_buttons.swift` | Small UI helpers |
 | `setup.sh` | One-shot installer for everything automatable |
 | `install.sh` | Installs only the AI Rewrite Automator Quick Action (called by `setup.sh`) |
