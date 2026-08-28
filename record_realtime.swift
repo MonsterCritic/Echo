@@ -93,10 +93,25 @@ guard let apiKey = resolveAPIKey() else {
 /// language the dictation will be pasted in.
 final class LangStrip: NSView {
     var onClick: (() -> Void)?
+    var labelView: NSTextField?
+    var ruleView: NSBox?
+
     override func mouseDown(with event: NSEvent) { onClick?() }
+
     /// Swallow the hit itself so the label inside doesn't take the click.
     override func hitTest(_ point: NSPoint) -> NSView? {
         bounds.contains(convert(point, from: superview)) ? self : nil
+    }
+
+    /// Centre the label as the panel grows. A stretched NSTextField draws its
+    /// text at the top of its frame, so simply resizing it with the column left
+    /// the language pinned to the top edge.
+    override func layout() {
+        super.layout()
+        let h: CGFloat = 18
+        labelView?.frame = NSRect(x: 0, y: (bounds.height - h) / 2,
+                                  width: bounds.width, height: h)
+        ruleView?.frame = NSRect(x: 0, y: 8, width: 1, height: max(bounds.height - 16, 0))
     }
 }
 
@@ -125,7 +140,12 @@ final class LiveHUD {
     // the main thread mid-speech. Resizing with display: false lets AppKit
     // coalesce the redraw, so we can have both fit-to-content and smooth text.
     private let minHeight: CGFloat = 52         // ~1 line
-    private let maxHeight: CGFloat = 420        // ~14 lines, then it scrolls
+    // Three lines, then it scrolls. Measured from the field's own metrics once it
+    // exists rather than set as a pixel guess, so it is exactly three lines
+    // whatever the font does. The caption sits over the interface being dictated
+    // into, and past a few lines it is in the way — the newest words are what
+    // matter while speaking, and the whole text arrives on release anyway.
+    private var maxHeight: CGFloat = 420
     private var currentHeight: CGFloat = 0
     private let padX: CGFloat = 18
     private let padY: CGFloat = 12
@@ -200,7 +220,6 @@ final class LiveHUD {
 
         let rule = NSBox(frame: NSRect(x: 0, y: 8, width: 1, height: minHeight - 16))
         rule.boxType = .separator
-        rule.autoresizingMask = [.height]
         col.addSubview(rule)
 
         let bd = NSTextField(labelWithString: "")
@@ -208,10 +227,11 @@ final class LiveHUD {
         bd.textColor = NSColor.labelColor.withAlphaComponent(0.75)
         bd.alignment = .center
         bd.drawsBackground = false
-        bd.frame = NSRect(x: 0, y: 0, width: rightW, height: minHeight)
-        bd.autoresizingMask = [.height]
         bd.cell?.usesSingleLineMode = true
         col.addSubview(bd)
+        col.labelView = bd
+        col.ruleView = rule
+        col.needsLayout = true
 
         bg.addSubview(tf)
         bg.addSubview(col)
@@ -222,6 +242,7 @@ final class LiveHUD {
         badge = bd
         strip = col
         bgView = bg
+        maxHeight = heightFor("X\nX\nX") + padY * 2
     }
 
     /// Flip the language from the caption itself. Writes the same file the menubar
