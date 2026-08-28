@@ -89,6 +89,29 @@ guard let apiKey = resolveAPIKey() else {
 // the app remains the single final paste that dictate.py already does.
 //
 // Non-activating + click-through, so the caret stays in the user's input field.
+/// The language strip on the right of the caption. Clicking it switches the
+/// language the dictation will be pasted in.
+final class LangStrip: NSView {
+    var onClick: (() -> Void)?
+    override func mouseDown(with event: NSEvent) { onClick?() }
+    /// Swallow the hit itself so the label inside doesn't take the click.
+    override func hitTest(_ point: NSPoint) -> NSView? {
+        bounds.contains(convert(point, from: superview)) ? self : nil
+    }
+}
+
+/// The caption sits over whatever is being dictated into, so it must not absorb
+/// clicks — except on the strip, which is a control. Everything else reports no
+/// hit at all and the click reaches the app underneath.
+final class HUDContent: NSVisualEffectView {
+    var clickable: NSRect = .zero
+    override func hitTest(_ point: NSPoint) -> NSView? {
+        let local = convert(point, from: nil)
+        guard clickable.contains(local) else { return nil }
+        return super.hitTest(point)
+    }
+}
+
 final class LiveHUD {
     static let shared = LiveHUD()
 
@@ -106,26 +129,37 @@ final class LiveHUD {
     private var currentHeight: CGFloat = 0
     private let padX: CGFloat = 18
     private let padY: CGFloat = 12
-    // A strip along the top for the language badge. Reserved rather than overlaid,
-    // so a long caption can never run underneath it.
-    private let badgeH: CGFloat = 18
+    // A column down the right for the language, reserved rather than overlaid so a
+    // long caption can never run underneath it. It was briefly a strip along the
+    // TOP, which was wrong twice over: the panel's height is computed as the text
+    // height plus vertical padding, so stealing 18pt from the text field left it
+    // permanently too short for its own content — the first line was clipped, and
+    // the panel appeared to grow strangely. A column takes width, which the text
+    // measurement already accounts for.
+    private let rightW: CGFloat = 104
     private var badge: NSTextField?
+    private var strip: LangStrip?
     private var badgeTimer: Timer?
     private let bottomInset: CGFloat = 90
 
     private func build() {
-        let w = NSWindow(contentRect: NSRect(x: 0, y: 0, width: width, height: minHeight),
-                         styleMask: [.borderless, .nonactivatingPanel],
-                         backing: .buffered, defer: false)
+        // NSPanel, not NSWindow: .nonactivatingPanel only means anything on a panel,
+        // and the strip is clickable now. An ordinary window would activate this
+        // process on click and take focus away from the field being dictated into.
+        let w = NSPanel(contentRect: NSRect(x: 0, y: 0, width: width, height: minHeight),
+                        styleMask: [.borderless, .nonactivatingPanel],
+                        backing: .buffered, defer: false)
+        w.isFloatingPanel = true
+        w.becomesKeyOnlyIfNeeded = true
         w.isOpaque = false
         w.backgroundColor = .clear
         w.level = .floating                 // above normal windows
-        w.ignoresMouseEvents = true         // clicks pass through
+        w.ignoresMouseEvents = false        // only the strip accepts them
         w.hasShadow = true
         // Follow the user across Spaces / over fullscreen apps.
         w.collectionBehavior = [.canJoinAllSpaces, .fullScreenAuxiliary, .stationary]
 
-        let bg = NSVisualEffectView(frame: NSRect(x: 0, y: 0, width: width, height: minHeight))
+        let bg = HUDContent(frame: NSRect(x: 0, y: 0, width: width, height: minHeight))
         bg.material = .hudWindow
         bg.blendingMode = .behindWindow
         bg.state = .active
@@ -135,8 +169,8 @@ final class LiveHUD {
         bg.autoresizingMask = [.width, .height]
 
         let tf = NSTextField(frame: NSRect(x: padX, y: padY,
-                                          width: width - padX * 2,
-                                          height: minHeight - padY * 2 - badgeH))
+                                          width: width - rightW - padX * 2,
+                                          height: minHeight - padY * 2))
         tf.isEditable = false
         tf.isSelectable = false
         tf.isBordered = false
@@ -156,22 +190,53 @@ final class LiveHUD {
         // speaking: the setting can be flipped mid-hold with Globe + Space, and
         // otherwise the only way to find out which way it went is to finish the
         // sentence and see what language comes back.
+        // The column: a hairline separator, the language, and a hint that it can be
+        // clicked. Clicking beats reaching for the menubar mid-sentence, and works
+        // when the key combination does not.
+        let col = LangStrip(frame: NSRect(x: width - rightW, y: 0,
+                                          width: rightW, height: minHeight))
+        col.autoresizingMask = [.minXMargin, .height]
+        col.onClick = { LiveHUD.shared.toggleLanguage() }
+
+        let rule = NSBox(frame: NSRect(x: 0, y: 8, width: 1, height: minHeight - 16))
+        rule.boxType = .separator
+        rule.autoresizingMask = [.height]
+        col.addSubview(rule)
+
         let bd = NSTextField(labelWithString: "")
-        bd.frame = NSRect(x: padX, y: minHeight - padY / 2 - badgeH,
-                          width: width - padX * 2, height: badgeH)
-        bd.font = .systemFont(ofSize: 11, weight: .semibold)
-        bd.textColor = NSColor.labelColor.withAlphaComponent(0.45)
-        bd.alignment = .right
+        bd.font = .systemFont(ofSize: 12, weight: .semibold)
+        bd.textColor = NSColor.labelColor.withAlphaComponent(0.75)
+        bd.alignment = .center
         bd.drawsBackground = false
-        bd.autoresizingMask = [.width, .minYMargin]   // stays at the top as it grows
+        bd.frame = NSRect(x: 0, y: 0, width: rightW, height: minHeight)
+        bd.autoresizingMask = [.height]
+        bd.cell?.usesSingleLineMode = true
+        col.addSubview(bd)
 
         bg.addSubview(tf)
-        bg.addSubview(bd)
+        bg.addSubview(col)
+        bg.clickable = col.frame
         w.contentView = bg
         window = w
         label = tf
         badge = bd
+        strip = col
         bgView = bg
+    }
+
+    /// Flip the language from the caption itself. Writes the same file the menubar
+    /// item and Globe + Space write, so all three always agree.
+    func toggleLanguage() {
+        let path = NSString(string: "~/Library/Application Support/Echo/output_language")
+                   .expandingTildeInPath
+        let raw = (try? String(contentsOfFile: path, encoding: .utf8)) ?? ""
+        let ru = raw.trimmingCharacters(in: .whitespacesAndNewlines).lowercased().hasPrefix("ru")
+        let next = ru ? "en" : "ru"
+        let dir = (path as NSString).deletingLastPathComponent
+        try? FileManager.default.createDirectory(atPath: dir, withIntermediateDirectories: true)
+        try? (next + "\n").write(toFile: path, atomically: true, encoding: .utf8)
+        log("caption: language switched to \(next) by click")
+        DispatchQueue.main.async { self.refreshBadge() }
     }
 
     /// Read fresh each time — dictate.py reads the same file per dictation, so
@@ -181,7 +246,7 @@ final class LiveHUD {
                    .expandingTildeInPath
         let raw = (try? String(contentsOfFile: path, encoding: .utf8)) ?? ""
         let ru = raw.trimmingCharacters(in: .whitespacesAndNewlines).lowercased().hasPrefix("ru")
-        badge?.stringValue = ru ? "→ RUSSIAN" : "→ ENGLISH"
+        badge?.stringValue = ru ? "RUSSIAN" : "ENGLISH"
     }
 
     /// Height `text` needs at our fixed width, measured with the field's own cell
@@ -212,6 +277,8 @@ final class LiveHUD {
         let x = screen.midX - width / 2
         let y = screen.minY + bottomInset
         w.setFrame(NSRect(x: x, y: y, width: width, height: height), display: false)
+        // hitTest compares against this, so it has to track the resize.
+        if let strip = strip, let bg = bgView as? HUDContent { bg.clickable = strip.frame }
     }
 
     func show() {
@@ -264,7 +331,7 @@ final class LiveHUD {
         let t = raw.trimmingCharacters(in: .whitespacesAndNewlines)
         var display = t.isEmpty ? "Listening…" : t
 
-        let fits = maxHeight - padY * 2 - badgeH
+        let fits = maxHeight - padY * 2
         if heightFor(display) > fits {
             // Binary-search the longest suffix that still fits, so the newest
             // words — what's being spoken right now — stay visible.
