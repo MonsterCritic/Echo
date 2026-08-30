@@ -622,6 +622,37 @@ def focus_target_and_paste(target: str) -> tuple[bool, str]:
     return _paste_via_osascript(target)
 
 
+# Set once we have asked, so a missing grant cannot turn into a dialog on every
+# dictation. Delete it to ask again.
+GRANT_ASKED = os.path.expanduser("~/Library/Application Support/Echo/.accessibility_asked")
+
+
+def request_accessibility_once():
+    """Raise the system Accessibility prompt, from here rather than from a shell.
+
+    macOS attributes the request to the RESPONSIBLE process, so where it is asked
+    from decides what the dialog names and therefore which entry the approval
+    creates. Asked from a terminal it names the terminal, which grants nothing
+    useful to a helper launched by Karabiner. Asked from here — inside the
+    dictation that actually needs it — it names the process whose grant matters.
+
+    Only ever asked once. A permission dialog on every dictation would be worse
+    than the missing permission.
+    """
+    if os.path.exists(GRANT_ASKED):
+        return
+    try:
+        os.makedirs(os.path.dirname(GRANT_ASKED), exist_ok=True)
+        open(GRANT_ASKED, "w").close()
+        subprocess.Popen([PASTE_HELPER, "--grant"],
+                         stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        log("asked for Accessibility (once) — approve the dialog to restore fast pasting")
+        notify("Echo needs Accessibility",
+               "Approve the prompt so dictation can paste into the field again.")
+    except Exception as e:
+        log(f"could not raise the Accessibility prompt: {e}")
+
+
 def _paste_via_helper(target: str) -> tuple[bool, str]:
     """Try the CGEvent helper. Returns (ok, frontmost_before). ok is False if
     the helper is absent, not Accessibility-trusted (exit 2), or errors — the
@@ -637,6 +668,7 @@ def _paste_via_helper(target: str) -> tuple[bool, str]:
     if r.returncode != 0:
         if "ACCESSIBILITY_NOT_GRANTED" in r.stderr:
             log("paste_helper not yet Accessibility-trusted — using osascript")
+            request_accessibility_once()
         else:
             log(f"paste_helper exit {r.returncode}: {r.stderr.strip()[:120]}")
         return (False, r.stdout.strip())
