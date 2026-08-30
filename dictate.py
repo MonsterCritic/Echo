@@ -608,7 +608,7 @@ end tell
 ''')
 
 
-def focus_target_and_paste(target: str) -> str:
+def focus_target_and_paste(target: str) -> tuple[bool, str]:
     """Bring `target` forward (only if focus drifted) and send Cmd+V. Returns
     the app that was frontmost before pasting, for logging.
 
@@ -618,7 +618,7 @@ def focus_target_and_paste(target: str) -> str:
     Accessibility — so dictation keeps working before the one-time grant."""
     ok, front_before = _paste_via_helper(target)
     if ok:
-        return front_before
+        return (True, front_before)
     return _paste_via_osascript(target)
 
 
@@ -644,16 +644,16 @@ def _paste_via_helper(target: str) -> tuple[bool, str]:
     return (True, r.stdout.strip())
 
 
-def _paste_via_osascript(target: str) -> str:
+def _paste_via_osascript(target: str) -> tuple[bool, str]:
     """Fallback paste via osascript → System Events. Single pass: frontmost
     check, conditional reactivate, Cmd+V. (Reactivation is conditional because
     an unconditional 'set frontmost to true' on an Electron app kicks off a
     slow re-focus cycle that can drop the caret.) Returns frontmost-before."""
     if not target:
         paste()
-        return ""
+        return (True, "")
     safe = target.replace("\\", "\\\\").replace('"', '\\"')
-    _, out, _ = run_applescript(f'''
+    rc, out, err = run_applescript(f'''
 tell application "System Events"
     set fp to name of first process whose frontmost is true
     if fp is not "{safe}" then
@@ -664,7 +664,13 @@ tell application "System Events"
     return fp
 end tell
 ''')
-    return out.strip()
+    if rc != 0:
+        # Usually the automation permission for System Events, which is a
+        # different grant from the helper's. Say so rather than reporting a paste
+        # that never happened.
+        log(f"osascript paste failed (rc {rc}): {err[:120]}")
+        return (False, out.strip())
+    return (True, out.strip())
 
 
 def read_target_app() -> str | None:
@@ -745,14 +751,24 @@ def _finish_dictation(raw: str, clean: str, t0: float):
     # pass, to avoid paying the System Events cold-start cost more than once.
     target = read_target_app()
     if target:
-        front_before = focus_target_and_paste(target)
+        pasted, front_before = focus_target_and_paste(target)
         if front_before != target:
             log(f"focus had drifted: {front_before} → reactivated {target}, pasted  [+{time.monotonic()-t0:.2f}s]")
         else:
             log(f"focus still on {target} — pasted directly  [+{time.monotonic()-t0:.2f}s]")
     else:
         log("no target-app capture found, pasting into current frontmost")
-        focus_target_and_paste("")
+        pasted, _ = focus_target_and_paste("")
+
+    if not pasted:
+        # Both paste routes need a permission that can be revoked or invalidated
+        # — re-signing the helper is enough to void its Accessibility grant. When
+        # neither works the dictation must not also vanish: keep it on the
+        # clipboard rather than restoring the previous contents over it.
+        log(f"PASTE FAILED — left on the clipboard  [+{time.monotonic()-t0:.2f}s]")
+        notify("Dictation copied", "Couldn't paste — press Cmd+V to insert it.")
+        return
+
     log(f"PASTE DONE — total time [+{time.monotonic()-t0:.2f}s]")
 
     # Non-daemon thread so it keeps the process alive until the restore fires.
