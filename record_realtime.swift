@@ -91,27 +91,45 @@ guard let apiKey = resolveAPIKey() else {
 // Non-activating + click-through, so the caret stays in the user's input field.
 /// The language strip on the right of the caption. Clicking it switches the
 /// language the dictation will be pasted in.
+/// The controls beside the caption: language, microphone, and clear, stacked top
+/// to bottom. Rows divide the column evenly, so they stay usable whether the
+/// caption is one line or three.
 final class LangStrip: NSView {
-    var onClick: (() -> Void)?
-    var labelView: NSTextField?
+    struct Row {
+        let label: NSTextField
+        let action: (() -> Void)?      // nil = read-only, shown but not clickable
+    }
+
+    var rows: [Row] = []
     var ruleView: NSBox?
 
-    override func mouseDown(with event: NSEvent) { onClick?() }
+    override func mouseDown(with event: NSEvent) {
+        let p = convert(event.locationInWindow, from: nil)
+        guard !rows.isEmpty else { return }
+        let rowH = bounds.height / CGFloat(rows.count)
+        // Rows are laid out top-down; view coordinates count up from the bottom.
+        let idx = min(rows.count - 1, max(0, Int((bounds.height - p.y) / rowH)))
+        rows[idx].action?()
+    }
 
-    /// Swallow the hit itself so the label inside doesn't take the click.
+    /// Swallow the hit so the labels inside don't take the click themselves.
     override func hitTest(_ point: NSPoint) -> NSView? {
         bounds.contains(convert(point, from: superview)) ? self : nil
     }
 
-    /// Centre the label as the panel grows. A stretched NSTextField draws its
-    /// text at the top of its frame, so simply resizing it with the column left
-    /// the language pinned to the top edge.
+    /// A stretched NSTextField draws its text at the top of its frame, so each
+    /// label is centred inside its own row rather than resized with the column.
     override func layout() {
         super.layout()
-        let h: CGFloat = 18
-        labelView?.frame = NSRect(x: 0, y: (bounds.height - h) / 2,
-                                  width: bounds.width, height: h)
         ruleView?.frame = NSRect(x: 0, y: 8, width: 1, height: max(bounds.height - 16, 0))
+        guard !rows.isEmpty else { return }
+        let rowH = bounds.height / CGFloat(rows.count)
+        let textH: CGFloat = 14
+        for (i, row) in rows.enumerated() {
+            let top = bounds.height - CGFloat(i + 1) * rowH
+            row.label.frame = NSRect(x: 0, y: top + (rowH - textH) / 2,
+                                     width: bounds.width, height: textH)
+        }
     }
 }
 
@@ -133,7 +151,7 @@ final class LiveHUD {
     private var window: NSWindow?
     private var label: NSTextField?
     private var bgView: NSVisualEffectView?
-    private let width: CGFloat = 760
+    private let width: CGFloat = 900
     // The panel grows with the text instead of reserving a fixed block of screen.
     // Growth was what previously made a whole line appear at once, but the cause
     // was specifically setFrame(display: TRUE) forcing a synchronous redraw on
@@ -156,8 +174,9 @@ final class LiveHUD {
     // permanently too short for its own content — the first line was clipped, and
     // the panel appeared to grow strangely. A column takes width, which the text
     // measurement already accounts for.
-    private let rightW: CGFloat = 104
+    private let rightW: CGFloat = 150
     private var badge: NSTextField?
+    private var micLabel: NSTextField?
     private var strip: LangStrip?
     private var badgeTimer: Timer?
     private let bottomInset: CGFloat = 90
@@ -216,22 +235,42 @@ final class LiveHUD {
         let col = LangStrip(frame: NSRect(x: width - rightW, y: 0,
                                           width: rightW, height: minHeight))
         col.autoresizingMask = [.minXMargin, .height]
-        col.onClick = { LiveHUD.shared.toggleLanguage() }
 
         let rule = NSBox(frame: NSRect(x: 0, y: 8, width: 1, height: minHeight - 16))
         rule.boxType = .separator
         col.addSubview(rule)
 
-        let bd = NSTextField(labelWithString: "")
-        bd.font = .systemFont(ofSize: 12, weight: .semibold)
-        bd.textColor = NSColor.labelColor.withAlphaComponent(0.75)
-        bd.alignment = .center
-        bd.drawsBackground = false
-        bd.cell?.usesSingleLineMode = true
-        col.addSubview(bd)
-        col.labelView = bd
+        func row(_ size: CGFloat, _ weight: NSFont.Weight, _ alpha: CGFloat) -> NSTextField {
+            let f = NSTextField(labelWithString: "")
+            f.font = .systemFont(ofSize: size, weight: weight)
+            f.textColor = NSColor.labelColor.withAlphaComponent(alpha)
+            f.alignment = .center
+            f.drawsBackground = false
+            f.cell?.usesSingleLineMode = true
+            f.cell?.lineBreakMode = .byTruncatingTail
+            col.addSubview(f)
+            return f
+        }
+
+        let bd  = row(12, .semibold, 0.75)   // language — click to switch
+        let mic = row(10, .regular, 0.45)    // which microphone is being heard
+        let clr = row(11, .semibold, 0.55)   // discard what has been said so far
+        clr.stringValue = "CLEAR"
+
+        col.rows = [
+            .init(label: bd,  action: { LiveHUD.shared.toggleLanguage() }),
+            // Read-only for now: the engine holds the input device open for the
+            // duration, so changing it mid-recording means tearing the audio graph
+            // down and rebuilding it — which is exactly the operation that has
+            // failed repeatedly on this machine. Showing it is still worth it:
+            // "which microphone is this actually using" was previously unanswerable
+            // without reading a log.
+            .init(label: mic, action: nil),
+            .init(label: clr, action: { LiveHUD.shared.clearTranscript() }),
+        ]
         col.ruleView = rule
         col.needsLayout = true
+        micLabel = mic
 
         bg.addSubview(tf)
         bg.addSubview(col)
@@ -243,6 +282,11 @@ final class LiveHUD {
         strip = col
         bgView = bg
         maxHeight = heightFor("X\nX\nX") + padY * 2
+    }
+
+    /// Discard what has been transcribed so far, without stopping the recording.
+    func clearTranscript() {
+        session?.clearSoFar()
     }
 
     /// Flip the language from the caption itself. Writes the same file the menubar
@@ -268,6 +312,18 @@ final class LiveHUD {
         let raw = (try? String(contentsOfFile: path, encoding: .utf8)) ?? ""
         let ru = raw.trimmingCharacters(in: .whitespacesAndNewlines).lowercased().hasPrefix("ru")
         badge?.stringValue = ru ? "RUSSIAN" : "ENGLISH"
+
+        // Published by the recorder when it opens the device, so this is the mic
+        // actually in use rather than the one that was asked for.
+        let micPath = "/tmp/echo_input_actual.txt"
+        var mic = (try? String(contentsOfFile: micPath, encoding: .utf8))?
+                  .trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+        // Deliberately a file read, not a CoreAudio query: this runs on a timer
+        // several times a second while the caption is up, and CoreAudio is exactly
+        // the thing that has been hanging on this machine.
+        micLabel?.stringValue = mic.isEmpty
+            ? "—"
+            : mic.replacingOccurrences(of: " Microphone", with: "")
     }
 
     /// Height `text` needs at our fixed width, measured with the field's own cell
@@ -464,6 +520,10 @@ final class RealtimeSession {
     // and silently dropped the tail of the dictation.
     private var committedCount = 0
     private var completedCount = 0
+    // Utterances committed at or before this point were cleared by the user. Their
+    // transcriptions are still in flight and will arrive afterwards; without this
+    // they would append themselves back into a transcript that was just emptied.
+    private var discardThrough = 0
     private var commitRejected = false
 
     // Pause tracking: a noticeable silence between utterances almost always
@@ -553,6 +613,27 @@ final class RealtimeSession {
     /// The text to hand off: the server's completed transcription, or the
     /// streamed delta text if (unexpectedly) no completed event ever arrived, so
     /// a dictation is never silently lost.
+    /// Throw away everything said so far and keep listening.
+    ///
+    /// For the case where the opening words came out wrong: rather than stopping,
+    /// pasting the mistake and starting again, drop what has accumulated and carry
+    /// on talking. Only the text after this point is pasted.
+    ///
+    /// The recording is untouched — this clears what has been transcribed, not the
+    /// audio stream, so speech continues to arrive without a gap.
+    func clearSoFar() {
+        lock.lock()
+        transcript = ""
+        deltaText = ""
+        lastDeltaAt = nil
+        // Everything already committed is now unwanted, including the utterances
+        // whose transcriptions have not come back yet.
+        discardThrough = committedCount
+        lock.unlock()
+        log("caption: cleared by the user — keeping the recording running")
+        LiveHUD.shared.update("")
+    }
+
     func finalText() -> String {
         lock.lock(); defer { lock.unlock() }
         let t = transcript.trimmingCharacters(in: .whitespacesAndNewlines)
@@ -617,7 +698,8 @@ final class RealtimeSession {
                       .trimmingCharacters(in: .whitespacesAndNewlines)
             lock.lock()
             completedCount += 1
-            if !seg.isEmpty {
+            let stale = completedCount <= discardThrough
+            if !seg.isEmpty && !stale {
                 transcript += transcript.isEmpty ? seg : " " + seg
             }
             lastActivity = Date()
@@ -628,7 +710,8 @@ final class RealtimeSession {
             // the display jump backwards to a shorter, earlier state mid-speech
             // (text appeared to freeze on a word, then leap forward). The HUD
             // follows only the monotonically growing delta stream.
-            log("utterance transcribed \(d)/\(c) (\(seg.count) chars)")
+            log("utterance transcribed \(d)/\(c) (\(seg.count) chars)"
+                + (stale ? " — discarded, cleared by the user" : ""))
         case "conversation.item.input_audio_transcription.delta":
             // Deltas stream as speech arrives and are purely additive, so they
             // ARE the transcript — we build it here rather than waiting for the
@@ -727,6 +810,19 @@ func hasInputChannels(_ id: AudioDeviceID) -> Bool {
     guard AudioObjectGetPropertyData(id, &addr, 0, nil, &size, raw) == noErr else { return false }
     let list = UnsafeMutableAudioBufferListPointer(raw.assumingMemoryBound(to: AudioBufferList.self))
     return list.reduce(0) { $0 + Int($1.mNumberChannels) } > 0
+}
+
+/// The system default input device.
+func defaultInputDeviceID() -> AudioDeviceID? {
+    var addr = AudioObjectPropertyAddress(
+        mSelector: kAudioHardwarePropertyDefaultInputDevice,
+        mScope: kAudioObjectPropertyScopeGlobal,
+        mElement: kAudioObjectPropertyElementMain)
+    var id = AudioDeviceID(0)
+    var sz = UInt32(MemoryLayout<AudioDeviceID>.size)
+    guard AudioObjectGetPropertyData(AudioObjectID(kAudioObjectSystemObject),
+                                     &addr, 0, nil, &sz, &id) == noErr else { return nil }
+    return id
 }
 
 /// Human-readable name of one device.
@@ -1009,6 +1105,25 @@ func startRecording() {
         let ms = Int(Date().timeIntervalSince(pressedAt) * 1000)
         finishEngineWatch(watch)
         log("recording started (in: \(nodeFormat.sampleRate)Hz, delay: \(s.delay), \(ms)ms after press)")
+
+        // Publish which device is actually being heard, for the caption to show.
+        // Once per recording, off the HUD's refresh path.
+        if let unit = input.audioUnit {
+            var dev = AudioDeviceID(0)
+            var sz = UInt32(MemoryLayout<AudioDeviceID>.size)
+            if AudioUnitGetProperty(unit, kAudioOutputUnitProperty_CurrentDevice,
+                                    kAudioUnitScope_Global, 0, &dev, &sz) == noErr,
+               var name = deviceName(dev) {
+                // When the engine follows the system default it reports an internal
+                // aggregate ("CADefaultDeviceAggregate-3338-0"), which is true but
+                // unreadable. Resolve it to the device that aggregate stands for.
+                if name.hasPrefix("CADefaultDeviceAggregate"),
+                   let def = defaultInputDeviceID(), let real = deviceName(def) {
+                    name = real
+                }
+                try? name.write(toFile: actualInputFile, atomically: true, encoding: .utf8)
+            }
+        }
     }
     catch {
         finishEngineWatch(watch)
