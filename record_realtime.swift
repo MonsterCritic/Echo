@@ -288,8 +288,10 @@ final class LiveHUD {
     func cycleInput() {
         let devices = inputDeviceList()
         guard devices.count > 1 else { return }
-        let current = (try? String(contentsOfFile: actualInputFile, encoding: .utf8))?
-                      .trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+        let current = pendingInputName
+            ?? (try? String(contentsOfFile: actualInputFile, encoding: .utf8))?
+                .trimmingCharacters(in: .whitespacesAndNewlines)
+            ?? ""
         let i = devices.firstIndex { $0.name == current } ?? -1
         let next = devices[(i + 1) % devices.count]
         micLabel?.stringValue = "switching…"
@@ -336,9 +338,14 @@ final class LiveHUD {
         // Deliberately a file read, not a CoreAudio query: this runs on a timer
         // several times a second while the caption is up, and CoreAudio is exactly
         // the thing that has been hanging on this machine.
-        micLabel?.stringValue = mic.isEmpty
-            ? "—"
-            : mic.replacingOccurrences(of: " Microphone", with: "")
+        func short(_ n: String) -> String { n.replacingOccurrences(of: " Microphone", with: "") }
+        if let pending = pendingInputName {
+            // Says plainly that the click landed but the change waits for the next
+            // hold — better than showing a device that is not being recorded from.
+            micLabel?.stringValue = "NEXT: " + short(pending)
+        } else {
+            micLabel?.stringValue = mic.isEmpty ? "—" : short(mic)
+        }
     }
 
     /// Height `text` needs at our fixed width, measured with the field's own cell
@@ -840,6 +847,19 @@ func defaultInputDeviceID() -> AudioDeviceID? {
     return id
 }
 
+/// Point macOS at a different input. Used when a live switch is refused, so the
+/// choice still takes effect on the next dictation rather than being discarded.
+func setDefaultInputDevice(_ id: AudioDeviceID) -> Bool {
+    var addr = AudioObjectPropertyAddress(
+        mSelector: kAudioHardwarePropertyDefaultInputDevice,
+        mScope: kAudioObjectPropertyScopeGlobal,
+        mElement: kAudioObjectPropertyElementMain)
+    var dev = id
+    return AudioObjectSetPropertyData(AudioObjectID(kAudioObjectSystemObject),
+                                      &addr, 0, nil,
+                                      UInt32(MemoryLayout<AudioDeviceID>.size), &dev) == noErr
+}
+
 /// Human-readable name of one device.
 func deviceName(_ id: AudioDeviceID) -> String? {
     var addr = AudioObjectPropertyAddress(
@@ -895,6 +915,11 @@ func inputDeviceList() -> [(id: AudioDeviceID, name: String)] {
     }
 }
 
+// A device chosen mid-dictation that could not be applied live. Shown in the
+// caption so the click is visibly not ignored, and cleared once a recording
+// actually opens on it.
+var pendingInputName: String?
+
 // Reinstalls the mic tap for the recording in progress. Held here because
 // switching devices has to tear the tap down and put it back, and the closure it
 // needs captures per-recording state that only startRecording has.
@@ -948,6 +973,20 @@ func switchInputDevice(to target: AudioDeviceID, named: String) {
         if apply(previous) {
             if let n = deviceName(previous) {
                 try? n.write(toFile: actualInputFile, atomically: true, encoding: .utf8)
+            }
+            // The recording keeps the old device, but the choice is not thrown
+            // away: point macOS at the new one so the next dictation opens it.
+            // The menubar's input guard is told too, or it would pull the default
+            // straight back to whatever it is holding.
+            if setDefaultInputDevice(target) {
+                let dir = NSString(string: "~/Library/Application Support/Echo")
+                          .expandingTildeInPath
+                try? FileManager.default.createDirectory(atPath: dir,
+                                                         withIntermediateDirectories: true)
+                try? named.write(toFile: dir + "/preferred_input",
+                                 atomically: true, encoding: .utf8)
+                pendingInputName = named
+                log("'\(named)' will be used from the next dictation")
             }
             DispatchQueue.main.async { LiveHUD.shared.refreshNow() }
         } else {
@@ -1103,6 +1142,7 @@ func startRecording() {
     stateLock.unlock()
 
     log("hold: start")   // everything below has hung at least once; mark the phases
+    pendingInputName = nil      // whatever opens now is the real device
 
     // Watch this attempt: if the engine isn't running shortly, the graph is stuck
     // and only a fresh process can help.
