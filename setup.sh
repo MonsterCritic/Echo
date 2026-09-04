@@ -137,7 +137,7 @@ codesign --force --sign - "$BIN_DIR/lang_toggle" 2>/dev/null || true
 swiftc -O pcm_play.swift -o pcm_play
 
 # ── 6. Make scripts executable ───────────────────────────────────────────────
-chmod +x rewrite_selection.sh rewrite.py dictate.py speak.py install.sh
+chmod +x rewrite_selection.sh rewrite.py dictate.py speak.py paste_last.py install.sh
 
 # ── 7. Install AI Rewrite Quick Action ───────────────────────────────────────
 echo "Installing AI Rewrite Quick Action…"
@@ -219,6 +219,16 @@ cat > "$KARABINER_DIR/echo.json" <<EOF
                     },
                     "to": [
                         { "shell_command": "'$BIN_DIR/lang_toggle' &" }
+                    ]
+                },
+                {
+                    "type": "basic",
+                    "from": {
+                        "key_code": "v",
+                        "modifiers": { "mandatory": ["command", "option", "shift"] }
+                    },
+                    "to": [
+                        { "shell_command": "/usr/bin/python3 $SCRIPT_DIR/paste_last.py &" }
                     ]
                 }
             ]
