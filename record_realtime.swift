@@ -942,6 +942,11 @@ var deadCaptures = 0
 let deadCaptureLimit = 2
 var recordingStartedAt = Date()
 
+// How long Globe must be held before the caption appears. Above a tap (AI
+// Rewrite, typically well under 200ms) and far below a dictation, so the caption
+// shows for one and never for the other.
+let hudMinHoldSeconds = 0.4
+
 let pinSettled = DispatchSemaphore(value: 0)
 var pinSignalled = false
 let pinLock = NSLock()
@@ -1100,7 +1105,31 @@ func startRecording() {
         // Tied to a converted, non-empty buffer rather than to `loggedFirst`,
         // which the failure branch above also sets — the caption must only ever
         // promise what the mic is actually delivering.
-        if !hudShown { hudShown = true; LiveHUD.shared.show() }
+        //
+        // Held back for a moment, though. A Globe TAP is AI Rewrite, and since the
+        // recording starts on key-down there is now a real, brief recording behind
+        // every tap: audio arrives about 140ms in, so the caption flashed
+        // "Listening…" and vanished on every rewrite. Waiting until the key has
+        // been down longer than a tap means it never appears for one, while a
+        // genuine hold — seconds of speech — still gets it almost immediately.
+        //
+        // Not a delay on the recording: audio is captured from key-down either
+        // way, so nothing spoken is lost by showing the caption later.
+        if !hudShown {
+            hudShown = true
+            let waited = Date().timeIntervalSince(pressedAt)
+            let remaining = max(0, hudMinHoldSeconds - waited)
+            DispatchQueue.main.asyncAfter(deadline: .now() + remaining) {
+                // Only if the key is still down. A tap has released by now, and a
+                // caption appearing after the fact would be worse than the flash.
+                stateLock.lock(); let live = isRecording; stateLock.unlock()
+                if live {
+                    LiveHUD.shared.show()
+                } else {
+                    log("caption: suppressed — Globe was tapped, not held")
+                }
+            }
+        }
         session?.sendAudio(pcm)
         stateLock.lock(); sentBytes += pcm.count; stateLock.unlock()
     }
