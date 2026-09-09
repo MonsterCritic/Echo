@@ -103,13 +103,18 @@ final class LangStrip: NSView {
     var rows: [Row] = []
     var ruleView: NSBox?
 
+    private let textH: CGFloat = 14
+    private let gap: CGFloat = 3
+
     override func mouseDown(with event: NSEvent) {
         let p = convert(event.locationInWindow, from: nil)
-        guard !rows.isEmpty else { return }
-        let rowH = bounds.height / CGFloat(rows.count)
-        // Rows are laid out top-down; view coordinates count up from the bottom.
-        let idx = min(rows.count - 1, max(0, Int((bounds.height - p.y) / rowH)))
-        rows[idx].action?()
+        // Hit-test the labels where they actually are, with the gap split between
+        // neighbours, rather than dividing the column into equal bands — the two
+        // stopped agreeing once the rows became a centred group.
+        for row in rows where row.label.frame.insetBy(dx: 0, dy: -gap / 2 - 2).contains(p) {
+            row.action?()
+            return
+        }
     }
 
     /// Swallow the hit so the labels inside don't take the click themselves.
@@ -117,18 +122,20 @@ final class LangStrip: NSView {
         bounds.contains(convert(point, from: superview)) ? self : nil
     }
 
-    /// A stretched NSTextField draws its text at the top of its frame, so each
-    /// label is centred inside its own row rather than resized with the column.
+    /// The rows are a tight stack centred in the column, not one row per equal
+    /// band. Dividing the height evenly spread them to the edges — the language
+    /// pinned near the top and CLEAR near the bottom, with the microphone alone in
+    /// the middle — which read as three unrelated things rather than one group.
     override func layout() {
         super.layout()
         ruleView?.frame = NSRect(x: 0, y: 8, width: 1, height: max(bounds.height - 16, 0))
         guard !rows.isEmpty else { return }
-        let rowH = bounds.height / CGFloat(rows.count)
-        let textH: CGFloat = 14
-        for (i, row) in rows.enumerated() {
-            let top = bounds.height - CGFloat(i + 1) * rowH
-            row.label.frame = NSRect(x: 0, y: top + (rowH - textH) / 2,
-                                     width: bounds.width, height: textH)
+        let n = CGFloat(rows.count)
+        let groupH = n * textH + (n - 1) * gap
+        var y = (bounds.height + groupH) / 2 - textH      // top label, laid downward
+        for row in rows {
+            row.label.frame = NSRect(x: 0, y: y, width: bounds.width, height: textH)
+            y -= textH + gap
         }
     }
 }

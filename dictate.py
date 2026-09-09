@@ -160,6 +160,26 @@ PRETTIFY_KEEP_LANGUAGE_PROMPT = (
 OUTPUT_LANG_FILE = os.path.expanduser("~/Library/Application Support/Echo/output_language")
 
 
+def reset_output_language():
+    """Back to English. English is the default and a switch to Russian lasts one
+    dictation, so the choice does not silently persist into the next one.
+
+    Reset here — after the text has been translated — rather than when the hold
+    starts. Resetting at the start would wipe a choice made deliberately just
+    beforehand, from the caption, Globe + Space or the menubar, and that choice is
+    the whole point of being able to make it.
+    """
+    try:
+        if output_language() == "en":
+            return
+        os.makedirs(os.path.dirname(OUTPUT_LANG_FILE), exist_ok=True)
+        with open(OUTPUT_LANG_FILE, "w") as f:
+            f.write("en\n")
+        log("language back to English for the next dictation")
+    except OSError as e:
+        log(f"could not reset the language: {e}")
+
+
 def output_language() -> str:
     """'ru' to paste what was spoken, 'en' to translate. Defaults to English."""
     try:
@@ -752,6 +772,10 @@ def _delayed_restore(saved: str, clean: str):
 def _finish_dictation(raw: str, clean: str, t0: float):
     """Shared tail for both recorder paths: record history, then paste `clean`
     into the app that was frontmost when the hold started."""
+    # The language has been applied by now, so put it back to the default. A
+    # Russian switch is per-dictation, not a mode to get stuck in.
+    reset_output_language()
+
     # Write to history BEFORE paste so the text is always recoverable, even if
     # the paste lands in the wrong window or doesn't fire at all.
     try:
