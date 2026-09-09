@@ -220,16 +220,6 @@ cat > "$KARABINER_DIR/echo.json" <<EOF
                     "to": [
                         { "shell_command": "'$BIN_DIR/lang_toggle' &" }
                     ]
-                },
-                {
-                    "type": "basic",
-                    "from": {
-                        "key_code": "v",
-                        "modifiers": { "mandatory": ["command", "option", "shift"] }
-                    },
-                    "to": [
-                        { "shell_command": "/usr/bin/python3 $SCRIPT_DIR/paste_last.py &" }
-                    ]
                 }
             ]
         }
