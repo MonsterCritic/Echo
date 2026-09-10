@@ -653,6 +653,14 @@ final class RealtimeSession {
         return d
     }
 
+    /// Both texts as they stand, for comparing what the delta stream already had
+    /// against what waiting for the authoritative transcript actually bought.
+    func textsNow() -> (completed: String, delta: String) {
+        lock.lock(); defer { lock.unlock() }
+        return (transcript.trimmingCharacters(in: .whitespacesAndNewlines),
+                deltaText.trimmingCharacters(in: .whitespacesAndNewlines))
+    }
+
     /// True once every committed utterance has come back transcribed.
     func allSegmentsTranscribed() -> Bool {
         lock.lock(); defer { lock.unlock() }
@@ -949,6 +957,11 @@ var deadCaptures = 0
 let deadCaptureLimit = 2
 var recordingStartedAt = Date()
 
+// Longest we will wait after release for the authoritative transcription before
+// handing off whatever we have. The delta stream is usually already complete by
+// then, and translation — the far bigger cost — cannot start until this ends.
+let handoffCapSeconds = 1.2
+
 // How long Globe must be held before the caption appears. Above a tap (AI
 // Rewrite, typically well under 200ms) and far below a dictation, so the caption
 // shows for one and never for the other.
@@ -1227,24 +1240,43 @@ func stopRecording() {
     // off. The previous heuristic ("transcript stopped growing and went quiet")
     // bailed ~150ms after release whenever the user had paused, silently losing
     // the tail of the dictation. Now we wait on the actual segment count.
+    let committedBefore = s.segmentCounts().committed
     DispatchQueue.global().async {
-        // Give the trailing commit a moment to register before we compare counts.
-        usleep(250_000)
-        let deadline = Date().addingTimeInterval(10.0)
-        while Date() < deadline {
-            if s.allSegmentsTranscribed() {
-                // All known utterances are in. Allow a brief grace period in case
-                // the server is still opening one more segment for trailing audio.
-                if s.idleSeconds() > 0.5 { break }
-            }
-            usleep(100_000)
+        let began = Date()
+
+        // Wait for the trailing commit to register, rather than sleeping a flat
+        // 250ms for it. Until it does, "all segments transcribed" is trivially
+        // true and would hand off before the last words exist.
+        let commitDeadline = Date().addingTimeInterval(0.4)
+        while Date() < commitDeadline,
+              s.segmentCounts().committed == committedBefore {
+            usleep(25_000)
         }
+
+        // Then wait for the transcriptions, but not indefinitely. The old idle
+        // grace was 500ms on top of everything else, which put a floor of about
+        // three quarters of a second on every dictation before translation could
+        // even start.
+        let deadline = Date().addingTimeInterval(handoffCapSeconds)
+        while Date() < deadline {
+            if s.allSegmentsTranscribed(), s.idleSeconds() > 0.15 { break }
+            usleep(25_000)
+        }
+
         let (c, d) = s.segmentCounts()
         if d < c { log("WARNING: timed out with \(d)/\(c) segments transcribed") }
         let text = s.finalText()
         try? text.write(toFile: transcriptPath, atomically: true, encoding: .utf8)
         FileManager.default.createFile(atPath: readyFlag, contents: Data())
-        log("handoff: \(text.count) chars (\(d)/\(c) segments)")
+
+        // Does the delta stream already hold what waiting produced? If it
+        // consistently does, this wait can be dropped entirely and the whole
+        // interval goes away. Logged rather than assumed, because deltas lag
+        // speech and cutting this short is how the tail of a dictation gets lost.
+        let (completed, delta) = s.textsNow()
+        let waited = Int(-began.timeIntervalSinceNow * 1000)
+        log("handoff: \(text.count) chars (\(d)/\(c) segments) after \(waited)ms"
+            + "  [completed \(completed.count) vs delta \(delta.count) chars]")
         // Keep the HUD up until the text is handed off, then let dictate.py's
         // translate + paste take over.
         LiveHUD.shared.hide()
