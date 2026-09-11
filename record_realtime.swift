@@ -962,6 +962,11 @@ var recordingStartedAt = Date()
 // then, and translation — the far bigger cost — cannot start until this ends.
 let handoffCapSeconds = 1.2
 
+// How long the delta stream must be silent before we treat it as finished. Long
+// enough to cover the lag between speech and its deltas, short enough that it is
+// not the dominant cost of a dictation.
+let deltaQuietSeconds = 0.25
+
 // How long Globe must be held before the caption appears. Above a tap (AI
 // Rewrite, typically well under 200ms) and far below a dictation, so the caption
 // shows for one and never for the other.
@@ -1253,13 +1258,22 @@ func stopRecording() {
             usleep(25_000)
         }
 
-        // Then wait for the transcriptions, but not indefinitely. The old idle
-        // grace was 500ms on top of everything else, which put a floor of about
-        // three quarters of a second on every dictation before translation could
-        // even start.
+        // Stop as soon as the delta stream goes quiet, rather than waiting for the
+        // server's authoritative transcript.
+        //
+        // Measured over 17 real dictations: the completed transcript matched the
+        // deltas already in hand 16 times, and the seventeenth had MORE text in
+        // the deltas, not less. So the wait — a median of 789ms, never under
+        // 700ms — was buying nothing, while translation could not start until it
+        // ended. It is kept as an upper bound rather than removed, because the
+        // deltas lag speech and bailing the instant the key comes up is how the
+        // tail of a dictation was lost before.
         let deadline = Date().addingTimeInterval(handoffCapSeconds)
         while Date() < deadline {
             if s.allSegmentsTranscribed(), s.idleSeconds() > 0.15 { break }
+            // Nothing has arrived for a moment and there is already text: whatever
+            // is still coming would be an improvement on it, not the substance.
+            if s.idleSeconds() > deltaQuietSeconds, !s.textsNow().delta.isEmpty { break }
             usleep(25_000)
         }
 
