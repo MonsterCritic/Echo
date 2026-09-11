@@ -1269,16 +1269,25 @@ func stopRecording() {
         // deltas lag speech and bailing the instant the key comes up is how the
         // tail of a dictation was lost before.
         let deadline = Date().addingTimeInterval(handoffCapSeconds)
+        var stopReason = "cap"
         while Date() < deadline {
-            if s.allSegmentsTranscribed(), s.idleSeconds() > 0.15 { break }
+            if s.allSegmentsTranscribed(), s.idleSeconds() > 0.15 { stopReason = "server"; break }
             // Nothing has arrived for a moment and there is already text: whatever
             // is still coming would be an improvement on it, not the substance.
-            if s.idleSeconds() > deltaQuietSeconds, !s.textsNow().delta.isEmpty { break }
+            if s.idleSeconds() > deltaQuietSeconds, !s.textsNow().delta.isEmpty {
+                stopReason = "quiet"; break
+            }
             usleep(25_000)
         }
 
         let (c, d) = s.segmentCounts()
-        if d < c { log("WARNING: timed out with \(d)/\(c) segments transcribed") }
+        // Only the cap is a real timeout. Leaving before the server has committed
+        // every segment is now the normal path, and warning about it fired on
+        // every single dictation — a warning that always fires is one nobody
+        // reads, and it would bury the case that still matters.
+        if stopReason == "cap", d < c {
+            log("WARNING: timed out with \(d)/\(c) segments transcribed")
+        }
         let text = s.finalText()
         try? text.write(toFile: transcriptPath, atomically: true, encoding: .utf8)
         FileManager.default.createFile(atPath: readyFlag, contents: Data())
@@ -1289,7 +1298,7 @@ func stopRecording() {
         // speech and cutting this short is how the tail of a dictation gets lost.
         let (completed, delta) = s.textsNow()
         let waited = Int(-began.timeIntervalSinceNow * 1000)
-        log("handoff: \(text.count) chars (\(d)/\(c) segments) after \(waited)ms"
+        log("handoff: \(text.count) chars (\(d)/\(c) segments) after \(waited)ms via \(stopReason)"
             + "  [completed \(completed.count) vs delta \(delta.count) chars]")
         // Keep the HUD up until the text is handed off, then let dictate.py's
         // translate + paste take over.
