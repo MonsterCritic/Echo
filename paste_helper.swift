@@ -31,14 +31,8 @@ import CoreGraphics
 // stable identifier to look up later (measured: the Claude Code input exposes
 // neither an id nor a label). So one process has to capture at hold start and
 // still be alive at paste time — which is what this mode is: launched when the
-// key goes down, it waits for the text and then puts it where the hold began.
-// Deliberately left on the default timeout. Calling AXUIElementSetMessagingTimeout
-// on the SYSTEM-WIDE element sets a global default for every element in the
-// process, and doing so here made every query fail with cannotComplete — no
-// focused element could be read from any app at all, for four seconds at a
-// stretch, while the same code without it answers immediately. Per-application
-// elements get their timeout raised individually in enableAX.
-let systemWide = AXUIElementCreateSystemWide()
+// key goes down, it waits for the text, then puts focus and the caret back where
+// the hold began so the caller's ordinary Cmd+V lands there.
 var axEnabled = Set<pid_t>()
 
 func axAttr(_ el: AXUIElement, _ name: String) -> CFTypeRef? {
@@ -72,75 +66,94 @@ func enableAX(_ app: AXUIElement, _ pid: pid_t) {
 var lastAXError: AXError = .success
 var lastAXStage = ""
 
-/// Switch on the frontmost app's accessibility tree before asking it anything.
+/// The focused element of an app — the frontmost one unless a pid is given.
 ///
-/// There is a cycle otherwise: AXManualAccessibility has to be set on the
-/// application element, but finding that element by asking the accessibility layer
-/// which app is focused fails with cannotComplete precisely while the tree is
-/// still off. Seeding from NSWorkspace breaks it. This runs once, at hold start,
-/// in a process that has just launched — so NSWorkspace's answer is current, which
-/// it would not be in a long-lived watcher with no run loop.
-func primeFrontmostApp() {
-    guard let pid = NSWorkspace.shared.frontmostApplication?.processIdentifier else { return }
+/// Asks the APPLICATION element. The system-wide element is the usual way to ask
+/// "what is focused", and on this machine it fails with cannotComplete (-25204) on
+/// every call, for every app, with Accessibility granted. That one failure is why
+/// field capture failed on all 661 dictations it was tried on, and why the "is a
+/// text field focused" check always answered UNKNOWN. The same question put to an
+/// application element answers at once.
+///
+/// The frontmost app comes from NSWorkspace. That goes stale in a long-lived
+/// process with no run loop, but every mode of this tool is launched fresh at the
+/// moment it asks, so here it is current.
+func focusedElement(pid: pid_t? = nil) -> AXUIElement? {
+    guard let pid = pid ?? NSWorkspace.shared.frontmostApplication?.processIdentifier else {
+        lastAXStage = "frontmost-app"
+        return nil
+    }
     let app = AXUIElementCreateApplication(pid)
     enableAX(app, pid)
-}
-
-func focusedElement() -> AXUIElement? {
-    // Ask the focused application, not NSWorkspace: NSWorkspace tracks the
-    // frontmost app through run-loop notifications this tool does not have.
-    var appV: CFTypeRef?
-    lastAXError = AXUIElementCopyAttributeValue(
-        systemWide, kAXFocusedApplicationAttribute as CFString, &appV)
-    lastAXStage = "focused-app"
-    if lastAXError == .success, let appV = appV {
-        let app = appV as! AXUIElement
-        var pid: pid_t = 0
-        if AXUIElementGetPid(app, &pid) == .success { enableAX(app, pid) }
-        var v: CFTypeRef?
-        lastAXError = AXUIElementCopyAttributeValue(
-            app, kAXFocusedUIElementAttribute as CFString, &v)
-        lastAXStage = "focused-element-of-app"
-        if lastAXError == .success, let v = v { return (v as! AXUIElement) }
-    }
     var v: CFTypeRef?
-    lastAXError = AXUIElementCopyAttributeValue(
-        systemWide, kAXFocusedUIElementAttribute as CFString, &v)
-    lastAXStage = "focused-element-systemwide"
+    lastAXError = AXUIElementCopyAttributeValue(app, kAXFocusedUIElementAttribute as CFString, &v)
+    lastAXStage = "focused-element-of-app"
     guard lastAXError == .success, let v = v else { return nil }
     return (v as! AXUIElement)
 }
 
-/// Bring the field's app forward, then ask the field itself for focus, and only
-/// report success if it actually took it.
-func restoreFocus(to el: AXUIElement) -> Bool {
-    var pid: pid_t = 0
-    if AXUIElementGetPid(el, &pid) == .success,
-       let app = NSRunningApplication(processIdentifier: pid), !app.isActive {
-        app.activate(options: [.activateIgnoringOtherApps])
-        usleep(200_000)
-    }
-    let setErr = AXUIElementSetAttributeValue(el, kAXFocusedAttribute as CFString, kCFBooleanTrue)
-    guard setErr == .success else {
-        FileHandle.standardError.write("SET_FOCUS_REFUSED:\(setErr.rawValue)\n".data(using: .utf8)!)
-        return false
-    }
-    usleep(120_000)
-    guard let now = focusedElement() else {
-        FileHandle.standardError.write("FOCUS_UNREADABLE_AFTER_SET\n".data(using: .utf8)!)
-        return false
-    }
-    if CFEqual(now, el) { return true }
-    FileHandle.standardError.write("FOCUS_WENT_ELSEWHERE\n".data(using: .utf8)!)
-    return false
+/// Whether text can be typed into this element.
+///
+/// The role catches ordinary fields. The fallbacks catch editors built on
+/// contenteditable, which a web app can expose under a generic role: anything
+/// whose caret can be placed, or whose string value can be written, takes text.
+func acceptsText(_ el: AXUIElement, role: String) -> Bool {
+    if role.contains("Text") || role == (kAXComboBoxRole as String) { return true }
+    if axSettable(el, kAXSelectedTextRangeAttribute as String) { return true }
+    return axSettable(el, kAXValueAttribute as String)
+        && axAttr(el, kAXValueAttribute as String) is String
 }
 
-/// Write straight into the field, which skips the clipboard entirely — no saving
-/// and restoring, and nothing of yours is overwritten even briefly.
-func insert(_ text: String, into el: AXUIElement) -> Bool {
-    guard axSettable(el, kAXSelectedTextAttribute as String) else { return false }
-    return AXUIElementSetAttributeValue(el, kAXSelectedTextAttribute as CFString,
-                                        text as CFTypeRef) == .success
+enum Return { case unmoved, restored, failed(String) }
+
+/// Put focus back in the field the hold started in, with the caret where it was.
+///
+/// If focus never left the field, nothing is touched: the caret may have moved
+/// inside it on purpose, and the paste should follow it there. Only when focus has
+/// gone somewhere else is the field refocused and the saved caret put back.
+func returnFocus(to field: AXUIElement, caret: CFTypeRef?) -> Return {
+    var pid: pid_t = 0
+    guard AXUIElementGetPid(field, &pid) == .success else { return .failed("FIELD_HAS_NO_APP") }
+
+    // Web apps rebuild parts of the page as it re-renders, which can destroy the
+    // very node that was captured. There is then nothing to return to.
+    var probe: CFTypeRef?
+    if AXUIElementCopyAttributeValue(field, kAXRoleAttribute as CFString, &probe) == .invalidUIElement {
+        return .failed("FIELD_GONE")
+    }
+
+    let app = AXUIElementCreateApplication(pid)
+    enableAX(app, pid)
+    let frontmost = (axAttr(app, kAXFrontmostAttribute as String) as? Bool) ?? false
+    if frontmost, let now = focusedElement(pid: pid), CFEqual(now, field) { return .unmoved }
+
+    if !frontmost, let running = NSRunningApplication(processIdentifier: pid) {
+        running.activate(options: [.activateIgnoringOtherApps])
+        usleep(200_000)
+    }
+    // A field in another window of the same app needs that window brought forward
+    // first: focusing an element inside a background window is quietly ignored.
+    if let w = axAttr(field, kAXWindowAttribute as String) {
+        let window = w as! AXUIElement
+        let current = axAttr(app, kAXFocusedWindowAttribute as String)
+        if current == nil || !CFEqual(current!, window) {
+            AXUIElementPerformAction(window, kAXRaiseAction as CFString)
+            AXUIElementSetAttributeValue(window, kAXMainAttribute as CFString, kCFBooleanTrue)
+            usleep(120_000)
+        }
+    }
+    let setErr = AXUIElementSetAttributeValue(field, kAXFocusedAttribute as CFString, kCFBooleanTrue)
+    guard setErr == .success else { return .failed("SET_FOCUS_REFUSED:\(setErr.rawValue)") }
+    usleep(120_000)
+
+    // Refocusing a field puts the caret wherever the app decides — often the end,
+    // sometimes selecting everything. Put back the position it had at hold start.
+    if let caret = caret, axSettable(field, kAXSelectedTextRangeAttribute as String) {
+        AXUIElementSetAttributeValue(field, kAXSelectedTextRangeAttribute as CFString, caret)
+    }
+
+    guard let now = focusedElement(pid: pid) else { return .failed("FOCUS_UNREADABLE_AFTER_SET") }
+    return CFEqual(now, field) ? .restored : .failed("FOCUS_WENT_ELSEWHERE")
 }
 
 let args = CommandLine.arguments
@@ -186,12 +199,12 @@ if checkOnly || grantMode {
 // rather than change behaviour on a failed reading.
 if args.contains("--focus-kind") {
     guard trusted else { print("UNKNOWN"); exit(2) }
-    primeFrontmostApp()
 
     // Short budget: this sits on the paste path, and a slow answer costs the user
     // more than a missing one. The tree is primed at hold start, so by now it is
     // usually warm.
     var role: String?
+    var focused: AXUIElement?
     var budget = 0.5
     if let i = args.firstIndex(of: "--focus-kind"), i + 1 < args.count,
        let v = Double(args[i + 1]) { budget = v }
@@ -200,19 +213,20 @@ if args.contains("--focus-kind") {
         if let el = focusedElement(),
            let r = axAttr(el, kAXRoleAttribute as String) as? String {
             role = r
+            focused = el
             break
         }
         usleep(60_000)
     } while Date() < deadline
 
-    guard let role = role else {
+    guard let role = role, let focused = focused else {
         print("UNKNOWN")
         FileHandle.standardError.write(
             "stage=\(lastAXStage) AXError=\(lastAXError.rawValue) trusted=\(trusted)\n"
                 .data(using: .utf8)!)
         exit(2)
     }
-    if role.contains("Text") || role == (kAXComboBoxRole as String) {
+    if acceptsText(focused, role: role) {
         print("TEXT")
         exit(0)
     }
@@ -220,9 +234,16 @@ if args.contains("--focus-kind") {
     exit(1)
 }
 
-// --capture <handoff-path>: hold the focused field, then place the text in it.
-//   exit 0 — text inserted into the field the hold started in
+// --capture <handoff-path>: hold the focused field, then return focus to it.
+//   exit 4 — focus is in the field the hold started in; the caller's Cmd+V lands
+//            there. stdout says UNMOVED (it never left) or RESTORED (it was put back)
 //   exit 3 — could not; the caller should fall back to activate-app + Cmd+V
+//
+// Delivery is always the caller's Cmd+V, never a direct accessibility write.
+// Writing the selected-text attribute reports success in Chromium editors without
+// always inserting anything, and a false success here means a lost dictation,
+// because the caller would skip its paste. Cmd+V into a focused field is the path
+// every dictation has used, so this only decides WHERE it lands.
 if let i = args.firstIndex(of: "--capture"), i + 1 < args.count {
     let handoff = args[i + 1]
     guard trusted else {
@@ -234,31 +255,34 @@ if let i = args.firstIndex(of: "--capture"), i + 1 < args.count {
     // forward — or the first time its accessibility tree is switched on — can
     // answer with nothing before it settles. A single read turned a perfectly
     // focused TextEdit document into NO_FOCUSED_FIELD.
-    primeFrontmostApp()
-
     // Keep asking for several seconds. Switching a Chromium app's accessibility
     // tree on is not instant, and its first answers come back as cannotComplete
     // while it is still being built — 1.5s of trying was not enough, and reported
     // "no focused field" for a field that was plainly focused. This costs nothing:
     // the hold is still in progress and this process is doing nothing else.
+    //
+    // Stops early in two cases. If the text arrives first, the hold was short and
+    // the caller is already waiting — carrying on here is what used to stall a
+    // paste by 2.5s. And a steady non-text answer is an answer: a canvas stays a
+    // canvas, so after a second and a half there is nothing more to wait for.
+    let pid = NSWorkspace.shared.frontmostApplication?.processIdentifier
     var captured: AXUIElement?
     var lastRole = ""
-    var reprimeAt = Date().addingTimeInterval(1.0)
+    var firstNonText: Date?
     let findDeadline = Date().addingTimeInterval(6.0)
     repeat {
-        if Date() > reprimeAt {          // the tree may have been switched off again
-            primeFrontmostApp()
-            reprimeAt = Date().addingTimeInterval(1.0)
-        }
-        if let el = focusedElement() {
+        if FileManager.default.fileExists(atPath: handoff) { break }
+        if let el = focusedElement(pid: pid) {
             let role = (axAttr(el, kAXRoleAttribute as String) as? String) ?? ""
             lastRole = role
-            // Only text-ish elements: capturing a button or a canvas would restore
-            // focus somewhere the text could never land.
-            if role.contains("Text") || role == (kAXComboBoxRole as String) {
+            // Only elements that take text: capturing a button or a canvas would
+            // restore focus somewhere the text could never land.
+            if acceptsText(el, role: role) {
                 captured = el
                 break
             }
+            if firstNonText == nil { firstNonText = Date() }
+            if let t = firstNonText, -t.timeIntervalSinceNow > 1.5 { break }
         }
         usleep(100_000)
     } while Date() < findDeadline
@@ -270,8 +294,8 @@ if let i = args.firstIndex(of: "--capture"), i + 1 < args.count {
         FileHandle.standardError.write((detail + "\n").data(using: .utf8)!)
         exit(3)
     }
-    let role = lastRole
-    print("CAPTURED:\(role)")
+    // Where the caret sits now, to put it back if focus wanders off and returns.
+    let caret = axAttr(field, kAXSelectedTextRangeAttribute as String)
 
     // Wait for the dictation to finish. The caller writes the handoff atomically,
     // so seeing the file means the whole text is there.
@@ -284,17 +308,15 @@ if let i = args.firstIndex(of: "--capture"), i + 1 < args.count {
     }
     try? FileManager.default.removeItem(atPath: handoff)
 
-    guard restoreFocus(to: field) else {
-        FileHandle.standardError.write("FOCUS_NOT_RESTORED\n".data(using: .utf8)!)
+    _ = text   // the caller pastes it; the file's arrival is the signal
+
+    switch returnFocus(to: field, caret: caret) {
+    case .unmoved:  print("UNMOVED:\(lastRole)");  exit(4)
+    case .restored: print("RESTORED:\(lastRole)"); exit(4)
+    case .failed(let why):
+        FileHandle.standardError.write((why + "\n").data(using: .utf8)!)
         exit(3)
     }
-    guard insert(text, into: field) else {
-        // Focus is back on the right field, so the caller's Cmd+V will now land
-        // in the right place even though direct insertion was refused.
-        FileHandle.standardError.write("FOCUS_RESTORED_BUT_NOT_WRITABLE\n".data(using: .utf8)!)
-        exit(4)
-    }
-    exit(0)
 }
 
 print(frontBefore)   // stdout → caller logs this

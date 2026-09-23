@@ -446,11 +446,12 @@ def write_clipboard(text: str):
 _focus_capture: subprocess.Popen | None = None
 
 
-# Off by default. The mechanism is proven in principle — the accessibility probe
-# restored focus to the Claude Code input and reported the field writable — but
-# the helper does not yet do it reliably: capture intermittently fails with
-# cannotComplete, and delivery has not been observed to succeed end to end. Until
-# it does, dictation behaves exactly as before. Turn it on with:
+# Off by default until it has a track record in real dictations. It failed on
+# every one of its first 661, all for a single reason: the helper asked the
+# system-wide accessibility element what was focused, and on this machine that
+# query always fails. Asking the app directly works, and the return path is
+# verified in TextEdit — back to the right window, caret on the right character,
+# from another window and from another app. Turn it on with:
 #   echo on > "$HOME/Library/Application Support/Echo/field_paste"
 FIELD_PASTE_FLAG = os.path.expanduser("~/Library/Application Support/Echo/field_paste")
 
@@ -464,7 +465,7 @@ def field_paste_enabled() -> bool:
 
 
 def start_focus_capture():
-    """Grab the text field being dictated into, for the length of the hold.
+    """Remember the text field being dictated into, for the length of the hold.
 
     Pasting has always targeted the frontmost APP, so stepping out of the input
     without leaving the app is invisible to it and the text lands wherever focus
@@ -496,11 +497,12 @@ def stop_focus_capture():
     _focus_capture = None
 
 
-def deliver_to_captured_field(clean: str, t0: float) -> bool:
-    """Put the text back where the hold started. True if it landed there.
+def return_to_captured_field(t0: float) -> bool:
+    """Put focus back in the field the hold started in. True if it is there now.
 
-    False means fall through to the app-level paste, which is what has always
-    happened — so this can only improve on it, never replace it with nothing.
+    The paste itself is still the ordinary Cmd+V that follows; this only decides
+    where it lands. False means fall through to the app-level paste, which is what
+    has always happened — so this can only improve on it, never lose the text.
     """
     global _focus_capture
     proc = _focus_capture
@@ -512,11 +514,13 @@ def deliver_to_captured_field(clean: str, t0: float) -> bool:
         log(f"no field captured ({why or 'helper exited early'}) — app-level paste")
         return False
 
+    # The file's arrival is the signal that the text is ready; the helper does not
+    # need the text itself, since the paste goes through the clipboard as always.
     tmp = HANDOFF_PATH + ".tmp"
     try:
         with open(tmp, "w") as f:
-            f.write(clean)
-        os.replace(tmp, HANDOFF_PATH)    # atomic: the helper never sees a partial write
+            f.write("go\n")
+        os.replace(tmp, HANDOFF_PATH)
     except OSError as e:
         log(f"handoff write failed: {e}")
         stop_focus_capture()
@@ -531,16 +535,16 @@ def deliver_to_captured_field(clean: str, t0: float) -> bool:
     finally:
         _focus_capture = None
 
-    if rc == 0:
-        log(f"inserted into the field the hold started in  [+{time.monotonic()-t0:.2f}s]")
+    out = (proc.stdout.read() or "").strip() if proc.stdout else ""
+    if rc == 4 and out.startswith("RESTORED"):
+        log(f"focus had moved — returned it to the field the hold started in  "
+            f"[+{time.monotonic()-t0:.2f}s]")
         return True
     if rc == 4:
-        # Focus is back on the right field but it refused a direct write, so the
-        # Cmd+V below will now land in the right place anyway.
-        log("focus restored to the original field; pasting there")
-        return False
+        log("focus still in the field the hold started in")
+        return True
     why = (proc.stderr.read() or "").strip() if proc.stderr else ""
-    log(f"field paste unavailable ({why or f'exit {rc}'}) — app-level paste")
+    log(f"could not return to the field ({why or f'exit {rc}'}) — app-level paste")
     return False
 
 
@@ -559,9 +563,11 @@ def notify(title: str, message: str):
 def focused_field_kind() -> str:
     """"TEXT", "NOT_TEXT:<role>", or "UNKNOWN" for the field focused right now.
 
-    UNKNOWN is not a synonym for NOT_TEXT: the accessibility layer on this machine
-    intermittently answers nothing at all, and treating that as "nowhere to type"
-    would stop pasting for no reason. Only a confident answer changes behaviour.
+    UNKNOWN is not a synonym for NOT_TEXT: an app can fail to answer, and treating
+    that as "nowhere to type" would stop pasting for no reason. Only a confident
+    answer changes behaviour. (Until the helper stopped asking the system-wide
+    element, every answer here was UNKNOWN — so this check has only just started
+    doing anything.)
     """
     if not os.path.exists(PASTE_HELPER):
         return "UNKNOWN"
@@ -783,22 +789,22 @@ def _finish_dictation(raw: str, clean: str, t0: float):
     except Exception as e:
         log(f"history write failed: {e}")
 
-    # Straight into the field the hold started in, when that is possible: it goes
-    # to the right place even if focus has moved on, and needs no clipboard at all.
-    if deliver_to_captured_field(clean, t0):
-        log(f"PASTE DONE — total time [+{time.monotonic()-t0:.2f}s]")
-        return
+    # Back into the field the hold started in, if focus wandered off during the
+    # hold or the translation — so the paste lands there, caret and all.
+    on_field = return_to_captured_field(t0)
 
     # Nowhere to type: don't paste. Cmd+V with no text field focused sends the
     # keystroke into a page, a canvas or a shortcut, and the dictation is gone.
     # Leaving it on the clipboard costs one Cmd+V and cannot lose anything.
-    kind = focused_field_kind()
-    if kind.startswith("NOT_TEXT"):
-        write_clipboard(clean)
-        log(f"no text field focused ({kind}) — left on the clipboard  "
-            f"[+{time.monotonic()-t0:.2f}s]")
-        notify("Dictation copied", "No text field was focused — press Cmd+V where you want it.")
-        return
+    # Skipped when focus was just returned to a field — that already answers it.
+    if not on_field:
+        kind = focused_field_kind()
+        if kind.startswith("NOT_TEXT"):
+            write_clipboard(clean)
+            log(f"no text field focused ({kind}) — left on the clipboard  "
+                f"[+{time.monotonic()-t0:.2f}s]")
+            notify("Dictation copied", "No text field was focused — press Cmd+V where you want it.")
+            return
 
     saved = read_clipboard()
     write_clipboard(clean)
