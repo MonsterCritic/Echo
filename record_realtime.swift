@@ -957,15 +957,12 @@ var deadCaptures = 0
 let deadCaptureLimit = 2
 var recordingStartedAt = Date()
 
-// Longest we will wait after release for the authoritative transcription before
-// handing off whatever we have. The delta stream is usually already complete by
-// then, and translation — the far bigger cost — cannot start until this ends.
-let handoffCapSeconds = 1.2
-
-// How long the delta stream must be silent before we treat it as finished. Long
-// enough to cover the lag between speech and its deltas, short enough that it is
-// not the dominant cost of a dictation.
-let deltaQuietSeconds = 0.25
+// Longest we will wait after release for the server to finish transcribing
+// before handing off whatever the delta stream holds. Only a backstop: across 24
+// dictations the server finished in a median of 777ms and never over 998ms, and
+// the wait has never actually timed out. Set with margin above that, because
+// hitting it is exactly the case that loses the end of a dictation.
+let handoffCapSeconds = 1.5
 
 // How long Globe must be held before the caption appears. Above a tap (AI
 // Rewrite, typically well under 200ms) and far below a dictation, so the caption
@@ -1249,6 +1246,11 @@ func stopRecording() {
     DispatchQueue.global().async {
         let began = Date()
 
+        // What the caption held when the key came up. Logged against the final
+        // text below, because this is the number that says how much of a
+        // dictation only arrives AFTER release.
+        let deltaAtRelease = s.textsNow().delta
+
         // Wait for the trailing commit to register, rather than sleeping a flat
         // 250ms for it. Until it does, "all segments transcribed" is trivially
         // true and would hand off before the last words exist.
@@ -1258,48 +1260,42 @@ func stopRecording() {
             usleep(25_000)
         }
 
-        // Stop as soon as the delta stream goes quiet, rather than waiting for the
-        // server's authoritative transcript.
+        // Wait for the server to say it is done — not for the delta stream to go
+        // quiet.
         //
-        // Measured over 17 real dictations: the completed transcript matched the
-        // deltas already in hand 16 times, and the seventeenth had MORE text in
-        // the deltas, not less. So the wait — a median of 789ms, never under
-        // 700ms — was buying nothing, while translation could not start until it
-        // ended. It is kept as an upper bound rather than removed, because the
-        // deltas lag speech and bailing the instant the key comes up is how the
-        // tail of a dictation was lost before.
+        // Breaking on quiet was tried and it cut dictations short. With delay set
+        // above "minimal" the model holds back its last words until the commit
+        // forces them out, so the stream is often already silent when the key
+        // comes up: the quiet check passed ~85ms after release, before those words
+        // existed. The evidence for it was misread, too. Deltas matched the
+        // completed transcript only because the comparison was made AFTER the
+        // wait — the wait was what let them catch up.
+        //
+        // A fixed delay after release would need to be ~1s every time to be safe.
+        // The server's completion is exact: it takes as long as this dictation
+        // needs and no longer.
         let deadline = Date().addingTimeInterval(handoffCapSeconds)
         var stopReason = "cap"
         while Date() < deadline {
             if s.allSegmentsTranscribed(), s.idleSeconds() > 0.15 { stopReason = "server"; break }
-            // Nothing has arrived for a moment and there is already text: whatever
-            // is still coming would be an improvement on it, not the substance.
-            if s.idleSeconds() > deltaQuietSeconds, !s.textsNow().delta.isEmpty {
-                stopReason = "quiet"; break
-            }
             usleep(25_000)
         }
 
         let (c, d) = s.segmentCounts()
-        // Only the cap is a real timeout. Leaving before the server has committed
-        // every segment is now the normal path, and warning about it fired on
-        // every single dictation — a warning that always fires is one nobody
-        // reads, and it would bury the case that still matters.
-        if stopReason == "cap", d < c {
-            log("WARNING: timed out with \(d)/\(c) segments transcribed")
-        }
+        if d < c { log("WARNING: timed out with \(d)/\(c) segments transcribed") }
         let text = s.finalText()
         try? text.write(toFile: transcriptPath, atomically: true, encoding: .utf8)
         FileManager.default.createFile(atPath: readyFlag, contents: Data())
 
-        // Does the delta stream already hold what waiting produced? If it
-        // consistently does, this wait can be dropped entirely and the whole
-        // interval goes away. Logged rather than assumed, because deltas lag
-        // speech and cutting this short is how the tail of a dictation gets lost.
-        let (completed, delta) = s.textsNow()
+        // How much of the text only existed after release. If the caption at
+        // release routinely already matches the final text, translation could
+        // start on it speculatively while this wait runs; if it routinely falls
+        // short, that is the tail a shortcut here would lose.
         let waited = Int(-began.timeIntervalSinceNow * 1000)
+        let atRelease = deltaAtRelease.trimmingCharacters(in: .whitespacesAndNewlines)
+        let same = atRelease.filter { !$0.isWhitespace } == text.filter { !$0.isWhitespace }
         log("handoff: \(text.count) chars (\(d)/\(c) segments) after \(waited)ms via \(stopReason)"
-            + "  [completed \(completed.count) vs delta \(delta.count) chars]")
+            + "  [caption at release \(atRelease.count) chars, \(same ? "complete" : "SHORT")]")
         // Keep the HUD up until the text is handed off, then let dictate.py's
         // translate + paste take over.
         LiveHUD.shared.hide()
