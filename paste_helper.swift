@@ -319,6 +319,31 @@ if let i = args.firstIndex(of: "--capture"), i + 1 < args.count {
     }
 }
 
+// --await-field <seconds> <preview>: hold a dictation until a text field is
+// clicked, for when it ended with no field focused.
+//   exit 0 — a field was clicked into and has focus; stdout FIELD:<role>. The
+//            caller pastes, so the text lands there.
+//   exit 5 — timed out
+//   exit 6 — cancelled with Esc
+//   (a newer dictation ends this with SIGTERM; the caller treats that as superseded)
+//
+// Recording often starts before the destination is chosen. Leaving the result on
+// the clipboard means remembering to paste it, and it displaces whatever was
+// there; holding it until the next field is clicked puts it where you choose.
+//
+// Only a CLICK inside a field counts, not any focus change. Apps move focus into
+// fields on their own — a new browser tab focuses its address bar, a dialog its
+// first input — and those would take the text before a choice was made.
+if let i = args.firstIndex(of: "--await-field") {
+    guard trusted else {
+        FileHandle.standardError.write("ACCESSIBILITY_NOT_GRANTED\n".data(using: .utf8)!)
+        exit(2)
+    }
+    let seconds = (i + 1 < args.count ? Double(args[i + 1]) : nil) ?? 60
+    let preview = i + 2 < args.count ? args[i + 2] : ""
+    AwaitField.run(seconds: seconds, preview: preview)
+}
+
 print(frontBefore)   // stdout → caller logs this
 
 if !trusted {
@@ -355,3 +380,151 @@ cmdDown?.post(tap: .cghidEventTap); usleep(8_000)
 keyDown?.post(tap: .cghidEventTap); usleep(8_000)
 keyUp?.post(tap: .cghidEventTap);   usleep(8_000)
 cmdUp?.post(tap: .cghidEventTap)
+
+
+// ── Waiting for a field (--await-field) ──────────────────────────────────────
+enum AwaitField {
+    /// Mouse presses since waiting began, in accessibility coordinates.
+    static var clicks: [(at: Date, point: CGPoint)] = []
+    static var panel: NSPanel?
+    static var bar: NSView?
+    static var began = Date()
+    static var seconds = 60.0
+
+    static func run(seconds: Double, preview: String) -> Never {
+        self.seconds = seconds
+        let app = NSApplication.shared
+        app.setActivationPolicy(.accessory)      // no Dock icon, never takes focus
+        showPill(preview: preview)
+
+        // Global monitors observe events bound for other apps without consuming
+        // them, so the click still does its normal job in the app underneath.
+        NSEvent.addGlobalMonitorForEvents(matching: [.leftMouseDown]) { _ in
+            clicks.append((Date(), axPoint(NSEvent.mouseLocation)))
+            clicks.removeAll { -$0.at.timeIntervalSinceNow > 2 }
+        }
+        NSEvent.addGlobalMonitorForEvents(matching: [.keyDown]) { e in
+            if e.keyCode == 53 { finish(6) }     // Esc
+        }
+        Timer.scheduledTimer(withTimeInterval: 0.08, repeats: true) { _ in
+            let elapsed = -began.timeIntervalSinceNow
+            if elapsed > seconds { finish(5) }
+            if let bar = bar, let w = panel?.contentView?.bounds.width {
+                bar.frame.size.width = w * CGFloat(max(0, 1 - elapsed / seconds))
+            }
+            check()
+        }
+        app.run()
+        exit(5)
+    }
+
+    /// Done when a press landed inside the field that now has focus.
+    static func check() {
+        // Wait out the press itself: pasting mid-click can land before the caret
+        // is placed, or turn a drag-selection into a replacement.
+        guard NSEvent.pressedMouseButtons == 0 else { return }
+        let recent = clicks.filter { -$0.at.timeIntervalSinceNow < 1.5 }
+        guard !recent.isEmpty, let el = focusedElement() else { return }
+        let role = (axAttr(el, kAXRoleAttribute as String) as? String) ?? ""
+        let subrole = (axAttr(el, kAXSubroleAttribute as String) as? String) ?? ""
+        // Never a password field.
+        guard subrole != (kAXSecureTextFieldSubrole as String),
+              acceptsText(el, role: role) else { return }
+        // The click must be inside the field. Without this, clicking a button that
+        // doesn't take focus would count, if a field happened to be focused already.
+        // Some fields don't report a frame; the recent click is all there is then.
+        if let frame = axFrame(el) {
+            let hit = frame.insetBy(dx: -6, dy: -6)
+            guard recent.contains(where: { hit.contains($0.point) }) else { return }
+        }
+        print("FIELD:\(role)")
+        finish(0)
+    }
+
+    static func finish(_ code: Int32) -> Never {
+        panel?.orderOut(nil)
+        exit(code)
+    }
+
+    /// Cocoa's global coordinates start bottom-left; accessibility's top-left.
+    static func axPoint(_ p: NSPoint) -> CGPoint {
+        let h = NSScreen.screens.first?.frame.height ?? 0
+        return CGPoint(x: p.x, y: h - p.y)
+    }
+
+    static func axFrame(_ el: AXUIElement) -> CGRect? {
+        guard let pv = axAttr(el, kAXPositionAttribute as String),
+              let sv = axAttr(el, kAXSizeAttribute as String) else { return nil }
+        var origin = CGPoint.zero, size = CGSize.zero
+        guard AXValueGetValue(pv as! AXValue, .cgPoint, &origin),
+              AXValueGetValue(sv as! AXValue, .cgSize, &size),
+              size.width > 0, size.height > 0 else { return nil }
+        return CGRect(origin: origin, size: size)
+    }
+
+    /// Where the caption was, in the same material, so it reads as the dictation
+    /// still being in hand rather than as a new alert. Clicks pass straight
+    /// through: the field you want may be right underneath.
+    static func showPill(preview: String) {
+        let size = NSSize(width: 560, height: 62)
+        let p = NSPanel(contentRect: NSRect(origin: .zero, size: size),
+                        styleMask: [.borderless, .nonactivatingPanel],
+                        backing: .buffered, defer: false)
+        p.isOpaque = false
+        p.backgroundColor = .clear
+        p.hasShadow = true
+        p.level = .floating
+        p.ignoresMouseEvents = true
+        p.collectionBehavior = [.canJoinAllSpaces, .fullScreenAuxiliary, .stationary]
+
+        let bg = NSVisualEffectView(frame: NSRect(origin: .zero, size: size))
+        bg.material = .hudWindow
+        bg.blendingMode = .behindWindow
+        bg.state = .active
+        bg.wantsLayer = true
+        bg.layer?.cornerRadius = 14
+        bg.layer?.masksToBounds = true
+
+        func label(_ text: String, _ font: NSFont, _ color: NSColor,
+                   _ frame: NSRect, _ align: NSTextAlignment = .left) -> NSTextField {
+            let f = NSTextField(labelWithString: text)
+            f.font = font
+            f.textColor = color
+            f.alignment = align
+            f.lineBreakMode = .byTruncatingTail
+            f.frame = frame
+            return f
+        }
+        let hintW: CGFloat = 110, padX: CGFloat = 18
+        let textW = size.width - padX * 2 - hintW
+        bg.addSubview(label("Click a text field to insert",
+                            .systemFont(ofSize: 15, weight: .medium), .labelColor,
+                            NSRect(x: padX, y: 32, width: textW, height: 20)))
+        let quoted = preview.isEmpty ? "" : "\u{201C}\(preview)\u{201D}"
+        bg.addSubview(label(quoted, .systemFont(ofSize: 13), .secondaryLabelColor,
+                            NSRect(x: padX, y: 12, width: textW, height: 17)))
+        bg.addSubview(label("Esc to cancel", .systemFont(ofSize: 12), .tertiaryLabelColor,
+                            NSRect(x: size.width - padX - hintW, y: 23, width: hintW, height: 16),
+                            .right))
+
+        // Time left, draining along the bottom edge.
+        let b = NSView(frame: NSRect(x: 0, y: 0, width: size.width, height: 2))
+        b.wantsLayer = true
+        b.layer?.backgroundColor = NSColor.labelColor.withAlphaComponent(0.28).cgColor
+        bg.addSubview(b)
+        bar = b
+
+        p.contentView = bg
+        let mouse = NSEvent.mouseLocation
+        let screen = NSScreen.screens.first { $0.frame.contains(mouse) }?.visibleFrame
+                  ?? NSScreen.main?.visibleFrame ?? NSRect(x: 0, y: 0, width: 1440, height: 900)
+        p.setFrameOrigin(NSPoint(x: screen.midX - size.width / 2, y: screen.minY + 90))
+        p.alphaValue = 0
+        p.orderFrontRegardless()
+        NSAnimationContext.runAnimationGroup { ctx in
+            ctx.duration = 0.15
+            p.animator().alphaValue = 1
+        }
+        panel = p
+    }
+}

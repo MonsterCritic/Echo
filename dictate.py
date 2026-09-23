@@ -12,6 +12,7 @@ import os
 import subprocess
 import json
 import re
+import signal
 import time
 import tempfile
 import threading
@@ -32,6 +33,8 @@ PASTE_HELPER = os.path.join(SCRIPT_DIR, "paste_helper")
 # Where the finished text is handed to the helper that has been holding the field
 # you started dictating in. Written atomically, so its appearance means complete.
 HANDOFF_PATH = "/tmp/rewrite_paste_handoff.txt"
+# pid of the helper holding a dictation until a text field is clicked
+AWAIT_PID    = "/tmp/rewrite_await_field.pid"
 
 # ── Which recorder are we paired with? ────────────────────────────────────────
 # True  → record_realtime.app streamed the audio to OpenAI's realtime API during
@@ -560,6 +563,73 @@ def notify(title: str, message: str):
         pass
 
 
+# How long a dictation waits for a text field to be clicked before giving up.
+AWAIT_FIELD_SECONDS = 60
+
+
+def cancel_pending_insert():
+    """A newer dictation replaces one still waiting for a field.
+
+    Two waiting at once would both fire on the same click and paste twice.
+    """
+    try:
+        with open(AWAIT_PID) as f:
+            pid = int(f.read().strip())
+        os.kill(pid, signal.SIGTERM)
+        log("replaced a dictation that was still waiting for a text field")
+    except (OSError, ValueError):
+        pass
+    try:
+        os.remove(AWAIT_PID)
+    except OSError:
+        pass
+
+
+def wait_for_text_field(clean: str) -> str:
+    """Hold the dictation until a text field is clicked.
+
+    Returns "FIELD" (clicked, focused, ready to paste), "CANCELLED" (Esc),
+    "SUPERSEDED" (a newer dictation took over), or "TIMEOUT" (which also covers
+    the helper being unable to wait at all).
+    """
+    if not os.path.exists(PASTE_HELPER):
+        return "TIMEOUT"
+    preview = " ".join(clean.split())[:120]
+    try:
+        proc = subprocess.Popen(
+            [PASTE_HELPER, "--await-field", str(AWAIT_FIELD_SECONDS), preview],
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+    except Exception as e:
+        log(f"could not wait for a field: {e}")
+        return "TIMEOUT"
+    try:
+        with open(AWAIT_PID, "w") as f:
+            f.write(str(proc.pid))
+    except OSError:
+        pass
+    try:
+        rc = proc.wait(timeout=AWAIT_FIELD_SECONDS + 10)
+    except subprocess.TimeoutExpired:
+        proc.kill()
+        rc = 5
+    try:
+        with open(AWAIT_PID) as f:
+            if f.read().strip() == str(proc.pid):
+                os.remove(AWAIT_PID)
+    except OSError:
+        pass
+    if rc == 0:
+        return "FIELD"
+    if rc == 6:
+        return "CANCELLED"
+    if rc == -signal.SIGTERM:
+        return "SUPERSEDED"
+    if rc not in (5,):
+        why = (proc.stderr.read() or "").strip() if proc.stderr else ""
+        log(f"field wait ended unexpectedly ({why or f'exit {rc}'})")
+    return "TIMEOUT"
+
+
 def focused_field_kind() -> str:
     """"TEXT", "NOT_TEXT:<role>", or "UNKNOWN" for the field focused right now.
 
@@ -789,30 +859,58 @@ def _finish_dictation(raw: str, clean: str, t0: float):
     except Exception as e:
         log(f"history write failed: {e}")
 
+    # This dictation is the one that gets delivered now.
+    cancel_pending_insert()
+
     # Back into the field the hold started in, if focus wandered off during the
     # hold or the translation — so the paste lands there, caret and all.
     on_field = return_to_captured_field(t0)
 
     # Nowhere to type: don't paste. Cmd+V with no text field focused sends the
     # keystroke into a page, a canvas or a shortcut, and the dictation is gone.
-    # Leaving it on the clipboard costs one Cmd+V and cannot lose anything.
+    # Hold it instead until a text field is clicked, and paste it there.
     # Skipped when focus was just returned to a field — that already answers it.
+    waited = False
     if not on_field:
         kind = focused_field_kind()
         if kind.startswith("NOT_TEXT"):
-            write_clipboard(clean)
-            log(f"no text field focused ({kind}) — left on the clipboard  "
+            log(f"no text field focused ({kind}) — waiting for one to be clicked  "
                 f"[+{time.monotonic()-t0:.2f}s]")
-            notify("Dictation copied", "No text field was focused — press Cmd+V where you want it.")
-            return
+            clipboard_then = read_clipboard()
+            outcome = wait_for_text_field(clean)
+            if outcome == "FIELD":
+                log(f"text field clicked after {time.monotonic()-t0:.1f}s — inserting there")
+                waited = True
+            elif outcome == "CANCELLED":
+                log("waiting for a field cancelled with Esc — kept in history only")
+                return
+            elif outcome == "SUPERSEDED":
+                log("a newer dictation took over — this one is kept in history only")
+                return
+            else:
+                # Nothing was clicked in time. The clipboard is the old fallback,
+                # but only if it still holds what it did when waiting began:
+                # anything copied since is yours, and must not be overwritten.
+                if read_clipboard() == clipboard_then:
+                    write_clipboard(clean)
+                    log("no field clicked in time — left on the clipboard")
+                    notify("Dictation copied", "No text field was clicked — press Cmd+V where you want it.")
+                else:
+                    log("no field clicked in time; the clipboard has changed since, so left it alone")
+                    notify("Dictation not inserted", "It's in the menubar under Recent.")
+                return
 
     saved = read_clipboard()
     write_clipboard(clean)
 
     # Bring the original app forward (only if focus drifted) and paste — in one
     # pass, to avoid paying the System Events cold-start cost more than once.
-    target = read_target_app()
-    if target:
+    # After waiting for a click, the target is wherever that click was, which is
+    # already frontmost — so no app is brought forward.
+    target = None if waited else read_target_app()
+    if waited:
+        pasted, _ = focus_target_and_paste("")
+    elif target:
         pasted, front_before = focus_target_and_paste(target)
         if front_before != target:
             log(f"focus had drifted: {front_before} → reactivated {target}, pasted  [+{time.monotonic()-t0:.2f}s]")
@@ -831,7 +929,10 @@ def _finish_dictation(raw: str, clean: str, t0: float):
         notify("Dictation copied", "Couldn't paste — press Cmd+V to insert it.")
         return
 
-    log(f"PASTE DONE — total time [+{time.monotonic()-t0:.2f}s]")
+    # Marked when the time includes waiting for a click, so latency figures read
+    # from this log can leave it out.
+    log(f"PASTE DONE — total time [+{time.monotonic()-t0:.2f}s]"
+        + ("  (waited for a field)" if waited else ""))
 
     # Non-daemon thread so it keeps the process alive until the restore fires.
     threading.Thread(target=_delayed_restore, args=(saved, clean)).start()
