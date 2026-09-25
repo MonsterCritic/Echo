@@ -104,6 +104,38 @@ func acceptsText(_ el: AXUIElement, role: String) -> Bool {
         && axAttr(el, kAXValueAttribute as String) is String
 }
 
+/// Where the captioned field sits on screen, for placing the caption beside it.
+/// Accessibility coordinates: top-left origin of the main display.
+let fieldFramePath = "/tmp/rewrite_field_frame"
+
+/// The rectangle the caption should keep clear of.
+///
+/// The field's own frame when it is believable. Some report nonsense — TextEdit
+/// gives its whole scrolling document, thousands of points tall and partly
+/// off-screen — and for those the line the caret is on is the honest answer.
+func fieldAnchor(_ field: AXUIElement, caret: CFTypeRef?) -> CGRect? {
+    let screens = NSScreen.screens
+    let h0 = screens.first?.frame.height ?? 0
+    func onScreen(_ r: CGRect) -> Bool {
+        let cocoa = CGRect(x: r.minX, y: h0 - r.maxY, width: r.width, height: r.height)
+        return screens.contains { $0.frame.contains(cocoa) }
+    }
+    if let r = AwaitField.axFrame(field), r.height <= 400, onScreen(r) { return r }
+    if let caret = caret {
+        var v: CFTypeRef?
+        if AXUIElementCopyParameterizedAttributeValue(
+               field, kAXBoundsForRangeParameterizedAttribute as CFString, caret, &v) == .success,
+           let v = v {
+            var r = CGRect.zero
+            if AXValueGetValue(v as! AXValue, .cgRect, &r), r.height > 0, r.height <= 200,
+               onScreen(r.insetBy(dx: -1, dy: 0)) {
+                return r
+            }
+        }
+    }
+    return nil
+}
+
 enum Return { case unmoved, restored, failed(String) }
 
 /// Put focus back in the field the hold started in, with the caret where it was.
@@ -296,6 +328,14 @@ if let i = args.firstIndex(of: "--capture"), i + 1 < args.count {
     }
     // Where the caret sits now, to put it back if focus wanders off and returns.
     let caret = axAttr(field, kAXSelectedTextRangeAttribute as String)
+
+    // Tell the caption where the field is, so it can sit beside it instead of
+    // over it. Written the moment the field is known — the caption appears a
+    // few hundred ms later, once audio is flowing.
+    if let r = fieldAnchor(field, caret: caret) {
+        try? "\(r.origin.x) \(r.origin.y) \(r.width) \(r.height)\n"
+            .write(toFile: fieldFramePath, atomically: true, encoding: .utf8)
+    }
 
     // Wait for the dictation to finish. The caller writes the handoff atomically,
     // so seeing the file means the whole text is there.

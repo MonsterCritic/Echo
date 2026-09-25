@@ -1060,6 +1060,10 @@ def main():
     readable; a launchd agent would be TCC-blocked from reading .env / the log.
     """
     log("LAUNCH (hold start) — warming up")
+    # The caption places itself beside the field this hold starts in; a frame
+    # left by an earlier hold would put it beside the wrong one.
+    try: os.remove("/tmp/rewrite_field_frame")
+    except OSError: pass
     prewarm_paste_helper()      # primary paste path
     prewarm_system_events()     # osascript fallback path
     start_focus_capture()       # hold the field being dictated into

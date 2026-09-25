@@ -348,24 +348,64 @@ final class LiveHUD {
         return ceil(needed)
     }
 
-    /// Bottom-centre of whichever screen holds the pointer — like live captions,
-    /// so it doesn't cover the input being typed into. The bottom edge stays put
-    /// and the panel grows upward.
+    /// Beside the field being dictated into when its position is known — below
+    /// it, or above if there is no room below — so the caption never covers what
+    /// you are writing in. Otherwise bottom-centre of the screen holding the
+    /// pointer, like live captions.
+    ///
+    /// The side is chosen once per recording, against the caption's MAXIMUM
+    /// height, so it never jumps from below to above as the text grows. Below,
+    /// the top edge stays put and it grows downward; above, it grows upward.
     ///
     /// `display: false` is important: the synchronous variant forces an immediate
     /// relayout on the main thread, which is what previously stalled the caption
     /// at each line wrap. This way AppKit redraws on its own next cycle.
     private func reposition(height: CGFloat) {
         guard let w = window else { return }
-        let mouse = NSEvent.mouseLocation
-        let screen = NSScreen.screens.first { $0.frame.contains(mouse) }?.visibleFrame
-                  ?? NSScreen.main?.visibleFrame
-                  ?? NSRect(x: 0, y: 0, width: 1440, height: 900)
-        let x = screen.midX - width / 2
-        let y = screen.minY + bottomInset
-        w.setFrame(NSRect(x: x, y: y, width: width, height: height), display: false)
+        let frame = placement(height: height) ?? {
+            let mouse = NSEvent.mouseLocation
+            let screen = NSScreen.screens.first { $0.frame.contains(mouse) }?.visibleFrame
+                      ?? NSScreen.main?.visibleFrame
+                      ?? NSRect(x: 0, y: 0, width: 1440, height: 900)
+            return NSRect(x: screen.midX - width / 2, y: screen.minY + bottomInset,
+                          width: width, height: height)
+        }()
+        w.setFrame(frame, display: false)
         // hitTest compares against this, so it has to track the resize.
         if let strip = strip, let bg = bgView as? HUDContent { bg.clickable = strip.frame }
+    }
+
+    /// Chosen side for this recording: nil until the field's position is known.
+    private var fieldSide: Bool? = nil        // true = below the field
+    private let fieldGap: CGFloat = 8
+
+    /// A frame beside the field, or nil to fall back to the screen default.
+    /// The field's position is published by the paste helper when it captures
+    /// the field at hold start (accessibility coordinates, top-left origin).
+    private func placement(height: CGFloat) -> NSRect? {
+        guard let raw = try? String(contentsOfFile: "/tmp/rewrite_field_frame", encoding: .utf8),
+              let attrs = try? FileManager.default.attributesOfItem(atPath: "/tmp/rewrite_field_frame"),
+              let mtime = attrs[.modificationDate] as? Date,
+              mtime >= recordingStartedAt.addingTimeInterval(-2) else { return nil }
+        let n = raw.split(separator: " ").compactMap { Double($0.trimmingCharacters(in: .whitespacesAndNewlines)) }
+        guard n.count == 4, let h0 = NSScreen.screens.first?.frame.height else { return nil }
+        // To Cocoa coordinates: bottom-left origin.
+        let field = NSRect(x: n[0], y: h0 - n[1] - n[3], width: n[2], height: n[3])
+        guard let screen = NSScreen.screens.first(where: {
+                  $0.frame.intersects(field) })?.visibleFrame else { return nil }
+
+        if fieldSide == nil {
+            let roomBelow = field.minY - fieldGap - screen.minY
+            let roomAbove = screen.maxY - (field.maxY + fieldGap)
+            if roomBelow >= maxHeight { fieldSide = true }
+            else if roomAbove >= maxHeight { fieldSide = false }
+            else { fieldSide = roomBelow >= roomAbove }
+        }
+        var x = field.midX - width / 2
+        x = min(max(x, screen.minX + 8), screen.maxX - width - 8)
+        var y = fieldSide! ? field.minY - fieldGap - height : field.maxY + fieldGap
+        y = min(max(y, screen.minY), screen.maxY - height)
+        return NSRect(x: x, y: y, width: width, height: height)
     }
 
     func show() {
@@ -377,11 +417,16 @@ final class LiveHUD {
             // notification to hang this off.
             self.badgeTimer?.invalidate()
             let t = Timer.scheduledTimer(withTimeInterval: 0.25, repeats: true) { [weak self] _ in
-                self?.refreshBadge()
+                guard let self = self else { return }
+                self.refreshBadge()
+                // The field's position can land after the caption appears; move
+                // beside it as soon as it does.
+                if self.fieldSide == nil { self.reposition(height: self.currentHeight) }
             }
             RunLoop.main.add(t, forMode: .common)
             self.badgeTimer = t
             self.pendingText = nil
+            self.fieldSide = nil
             self.currentHeight = self.minHeight
             self.reposition(height: self.minHeight)
             self.window?.orderFrontRegardless()   // show WITHOUT taking focus
