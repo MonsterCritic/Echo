@@ -402,13 +402,62 @@ def prettify(text: str, api_key: str) -> str:
     return out
 
 
+VOCABULARY_FILE = os.path.expanduser("~/Library/Application Support/Echo/vocabulary.json")
+
+
+def vocabulary_note() -> str:
+    """The user's own names and terms, as a rule placed next to the transcript.
+
+    Edited from the menubar. The recogniser swaps unfamiliar names for commoner
+    neighbours — "Jev" becomes Jeff, "Lemme" becomes Lemmy — and since dictation
+    is transcribed as Russian, the swap often happens in Cyrillic first. This is
+    the stage that sees the whole sentence, so it is where the name goes back.
+
+    Worded as a rule, not a hint, and placed beside the transcript rather than
+    at the end of the system prompt: as a gentle note there, the model ignored
+    it in every test case. The one exception is a well-known person or thing
+    that the sentence is plainly about — "Jeff Bezos" must stay Jeff.
+    """
+    try:
+        with open(VOCABULARY_FILE, encoding="utf-8") as f:
+            entries = json.load(f)
+    except (OSError, ValueError):
+        return ""
+    lines = []
+    for e in entries if isinstance(entries, list) else []:
+        word = str(e.get("word", "")).strip()
+        if not word:
+            continue
+        heard = [str(h).strip() for h in e.get("heard_as", []) if str(h).strip()]
+        if heard:
+            lines.append(f'- "{word}" — the transcript will usually show it as '
+                         + ", ".join(f'"{h}"' for h in heard)
+                         + ", or a Cyrillic spelling of those")
+        else:
+            lines.append(f'- "{word}"')
+    if not lines:
+        return ""
+    return ("<vocabulary>\n"
+            "These are the speaker's own names and product terms. The speech recogniser "
+            "does not know them and writes a similar-sounding common word instead. "
+            "Whenever the transcript contains one of those look-alikes, it IS the "
+            "speaker's term: write the term exactly as spelled below, in Latin letters, "
+            "in every language — this overrides any instruction to keep words unchanged, "
+            "even when the rest of the text stays Russian. "
+            "Only exception: the look-alike is part of a real, well-known name — followed "
+            "by a surname, or clearly about a famous person or company. Then keep it: "
+            "\"Jeff Bezos\" stays \"Jeff Bezos\" even if Jeff is listed below.\n"
+            + "\n".join(lines) + "\n</vocabulary>\n\n")
+
+
 def _prettify_call(text: str, api_key: str, system_prompt: str) -> str:
     payload = {
         "model": OPENAI_PRETTIFY_MODEL,
         "max_tokens": 4096,
         "messages": [
             {"role": "system", "content": system_prompt},
-            {"role": "user",   "content": f"<transcript>\n{text}\n</transcript>"},
+            {"role": "user",   "content": vocabulary_note()
+                                          + f"<transcript>\n{text}\n</transcript>"},
         ],
     }
     req = urllib.request.Request(

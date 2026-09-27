@@ -164,6 +164,43 @@ func setPastedLanguage(_ code: String) {
     try? (code + "\n").write(toFile: outputLangFile, atomically: true, encoding: .utf8)
 }
 
+// ── Vocabulary ────────────────────────────────────────────────────────────────
+// Words the recogniser gets wrong because it prefers a commoner neighbour —
+// "Jev" comes back as Jeff, "Lemme" as Lemmy or Lenny. Both dictation stages read
+// this on every dictation: the recorder primes the transcription model with the
+// words, and the translate step is told the spelling and the likely mishearings
+// so it can put the right word back from context. No restart needed.
+let vocabularyFile = NSString(string: "~/Library/Application Support/Echo/vocabulary.json")
+                     .expandingTildeInPath
+
+struct VocabWord {
+    var word: String
+    var heardAs: [String]
+}
+
+func loadVocabulary() -> [VocabWord] {
+    guard let data = FileManager.default.contents(atPath: vocabularyFile),
+          let list = try? JSONSerialization.jsonObject(with: data) as? [[String: Any]] else { return [] }
+    return list.compactMap { d in
+        guard let w = d["word"] as? String, !w.isEmpty else { return nil }
+        return VocabWord(word: w, heardAs: d["heard_as"] as? [String] ?? [])
+    }
+}
+
+func saveVocabulary(_ words: [VocabWord]) {
+    let list = words.map { ["word": $0.word, "heard_as": $0.heardAs] as [String: Any] }
+    guard let data = try? JSONSerialization.data(withJSONObject: list,
+                                                  options: [.prettyPrinted, .sortedKeys]) else { return }
+    let dir = (vocabularyFile as NSString).deletingLastPathComponent
+    try? FileManager.default.createDirectory(atPath: dir, withIntermediateDirectories: true)
+    try? data.write(to: URL(fileURLWithPath: vocabularyFile), options: .atomic)
+}
+
+/// "Jeff, Lemmy" → ["Jeff", "Lemmy"]
+func splitVariants(_ s: String) -> [String] {
+    s.split(separator: ",").map { $0.trimmingCharacters(in: .whitespaces) }.filter { !$0.isEmpty }
+}
+
 // ── How long the transcriber listens before committing ───────────────────────
 // The five tiers the API accepts. Lower gets text on screen sooner; higher gives
 // the model more audio before it commits, which is what decides whether the
@@ -543,6 +580,32 @@ class StatusController: NSObject, NSMenuDelegate {
 
         delayRoot.submenu = delayMenu
         menu.addItem(delayRoot)
+
+        // ── Vocabulary ───────────────────────────────────────────────────────
+        let words = loadVocabulary()
+        let vocabRoot = NSMenuItem(title: words.isEmpty ? "Vocabulary" : "Vocabulary (\(words.count))",
+                                   action: nil, keyEquivalent: "")
+        let vocabMenu = NSMenu()
+        for (i, w) in words.enumerated() {
+            let title = w.heardAs.isEmpty ? w.word
+                      : "\(w.word)   not \(w.heardAs.joined(separator: ", "))"
+            let item = NSMenuItem(title: title, action: #selector(editWord(_:)), keyEquivalent: "")
+            item.target = self
+            item.tag = i
+            item.toolTip = "Click to edit or remove"
+            vocabMenu.addItem(item)
+        }
+        if !words.isEmpty { vocabMenu.addItem(NSMenuItem.separator()) }
+        let addWord = NSMenuItem(title: "Add Word…", action: #selector(addWord), keyEquivalent: "")
+        addWord.target = self
+        vocabMenu.addItem(addWord)
+        vocabMenu.addItem(NSMenuItem.separator())
+        let vocabNote = NSMenuItem(title: "Names and terms to spell your way",
+                                   action: nil, keyEquivalent: "")
+        vocabNote.isEnabled = false
+        vocabMenu.addItem(vocabNote)
+        vocabRoot.submenu = vocabMenu
+        menu.addItem(vocabRoot)
         menu.addItem(NSMenuItem.separator())
 
         let openItem = NSMenuItem(title: "Open Full History",
@@ -685,6 +748,66 @@ class StatusController: NSObject, NSMenuDelegate {
     @objc func pickLanguage(_ sender: NSMenuItem) {
         guard let code = sender.representedObject as? String else { return }
         setPastedLanguage(code)
+    }
+
+    @objc func addWord() {
+        guard let (word, heard) = askForWord(title: "Add a word",
+                                             word: "", heard: "", removable: false).entry
+        else { return }
+        var words = loadVocabulary()
+        words.removeAll { $0.word.caseInsensitiveCompare(word) == .orderedSame }
+        words.append(VocabWord(word: word, heardAs: heard))
+        saveVocabulary(words)
+    }
+
+    @objc func editWord(_ sender: NSMenuItem) {
+        var words = loadVocabulary()
+        guard words.indices.contains(sender.tag) else { return }
+        let w = words[sender.tag]
+        let result = askForWord(title: "Edit \u{201C}\(w.word)\u{201D}", word: w.word,
+                                heard: w.heardAs.joined(separator: ", "), removable: true)
+        if result.remove {
+            words.remove(at: sender.tag)
+        } else if let (word, heard) = result.entry {
+            words[sender.tag] = VocabWord(word: word, heardAs: heard)
+        } else { return }
+        saveVocabulary(words)
+    }
+
+    /// One dialog for adding and editing: the word as it should be written, and
+    /// what the recogniser tends to hear instead (optional, comma-separated).
+    private func askForWord(title: String, word: String, heard: String,
+                            removable: Bool) -> (entry: (String, [String])?, remove: Bool) {
+        let alert = NSAlert()
+        alert.messageText = title
+        alert.informativeText = "Write the word the way it should appear. If you know what "
+            + "it gets heard as instead, add that too — separate several with commas."
+        let wordField = NSTextField(frame: NSRect(x: 0, y: 30, width: 300, height: 24))
+        wordField.placeholderString = "Written as, e.g. Lemme"
+        wordField.stringValue = word
+        let heardField = NSTextField(frame: NSRect(x: 0, y: 0, width: 300, height: 24))
+        heardField.placeholderString = "Often heard as, e.g. Lemmy, Lenny"
+        heardField.stringValue = heard
+        let box = NSView(frame: NSRect(x: 0, y: 0, width: 300, height: 54))
+        box.addSubview(wordField)
+        box.addSubview(heardField)
+        alert.accessoryView = box
+        alert.addButton(withTitle: "Save")
+        alert.addButton(withTitle: "Cancel")
+        if removable { alert.addButton(withTitle: "Remove") }
+        alert.window.initialFirstResponder = wordField
+        wordField.nextKeyView = heardField
+        // A menubar app is never active by itself; without this the fields
+        // can't take typing.
+        NSApp.activate(ignoringOtherApps: true)
+        let response = alert.runModal()
+        if response == .alertThirdButtonReturn { return (nil, true) }
+        guard response == .alertFirstButtonReturn else { return (nil, false) }
+        let w = wordField.stringValue.trimmingCharacters(in: .whitespaces)
+        guard !w.isEmpty else { return (nil, false) }
+        let variants = splitVariants(heardField.stringValue)
+            .filter { $0.caseInsensitiveCompare(w) != .orderedSame }
+        return ((w, variants), false)
     }
 
     /// No restart: record_realtime reads the tier when it opens each session.

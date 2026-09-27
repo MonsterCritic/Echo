@@ -631,7 +631,7 @@ final class RealtimeSession {
                         // en are listed because dictation mixes them ("localhost",
                         // "restore").
                         "languages": Self.languages,
-                        "prompt": Self.prompt,
+                        "prompt": Self.prompt + vocabularyHint(),
                         // Lowest latency, so words appear as they're spoken. Safe
                         // because the text we paste comes from the completed
                         // transcript, not this stream — a rougher live preview
@@ -824,6 +824,21 @@ final class RealtimeSession {
             break
         }
     }
+}
+
+// ── Vocabulary (edited from the menubar) ─────────────────────────────────────
+// Names the model would otherwise swap for a commoner word — "Jev" for Jeff,
+// "Lemme" for Lemmy. Listing them in the prompt makes the model reach for them.
+// Read per session, so an edit applies to the next hold. The phrase is in
+// Russian because the rest of the prompt is — a switch of language inside the
+// prompt is itself a cue the model follows.
+func vocabularyHint() -> String {
+    let path = NSString(string: "~/Library/Application Support/Echo/vocabulary.json")
+               .expandingTildeInPath
+    guard let data = FileManager.default.contents(atPath: path),
+          let list = try? JSONSerialization.jsonObject(with: data) as? [[String: Any]] else { return "" }
+    let words = list.compactMap { $0["word"] as? String }.filter { !$0.isEmpty }
+    return words.isEmpty ? "" : " Названия: " + words.joined(separator: ", ") + "."
 }
 
 // ── Input device pinning ─────────────────────────────────────────────────────
