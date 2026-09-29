@@ -157,33 +157,36 @@ final class HUDContent: NSVisualEffectView {
     }
 }
 
-/// Five bars that move with the microphone, shown beside "Listening…" until the
-/// first words arrive.
+/// The microphone level as a scrolling strip across the whole caption, shown
+/// until the first words arrive — in place of a "Listening…" label.
 ///
 /// With a recognition delay above minimal, text takes a couple of seconds to
 /// appear — measured at a median of 2.4s after the key goes down. For all that
-/// time "Listening…" looked exactly like a dictation that had failed. This shows,
-/// from the first buffer, that your voice is actually being heard.
+/// time a static "Listening…" looked exactly like a dictation that had failed.
+/// This moves with your voice from the first buffer, so it is visible at once
+/// that speech is being heard. Newest on the right; a buffer is ~43ms, so the
+/// strip holds the last few seconds.
 final class LevelMeter: NSView {
-    private var levels = [CGFloat](repeating: 0, count: 5)
+    private var levels: [CGFloat] = []
     private let barW: CGFloat = 3, gap: CGFloat = 3
 
-    static let size = NSSize(width: 5 * 3 + 4 * 3, height: 16)
+    private var capacity: Int { max(1, Int((bounds.width + gap) / (barW + gap))) }
 
-    /// 0…1. Scrolls in from the right, so the bars read as a short history
-    /// rather than five copies of the same number.
     func push(_ level: CGFloat) {
-        levels.removeFirst()
         levels.append(level)
+        if levels.count > capacity { levels.removeFirst(levels.count - capacity) }
         needsDisplay = true
     }
 
-    func reset() { levels = levels.map { _ in 0 }; needsDisplay = true }
+    func reset() { levels.removeAll(); needsDisplay = true }
 
     override func draw(_ dirtyRect: NSRect) {
         NSColor.labelColor.withAlphaComponent(0.75).setFill()
-        for (i, l) in levels.enumerated() {
-            // A floor, so silence shows as a row of dots, not as nothing.
+        // Right-aligned, so history scrolls in from the right edge; slots not yet
+        // filled draw as the silence floor — a row of dots, never an empty panel.
+        let n = capacity
+        let padded = [CGFloat](repeating: 0, count: max(0, n - levels.count)) + levels
+        for (i, l) in padded.enumerated() {
             let h = max(3, bounds.height * l)
             let r = NSRect(x: CGFloat(i) * (barW + gap), y: (bounds.height - h) / 2,
                            width: barW, height: h)
@@ -198,7 +201,7 @@ final class LiveHUD {
     private var window: NSWindow?
     private var label: NSTextField?
     private var bgView: NSVisualEffectView?
-    private let width: CGFloat = 900
+    private let width: CGFloat = 800
     // The panel grows with the text instead of reserving a fixed block of screen.
     // Growth was what previously made a whole line appear at once, but the cause
     // was specifically setFrame(display: TRUE) forcing a synchronous redraw on
@@ -271,8 +274,8 @@ final class LiveHUD {
         tf.cell?.wraps = true
         tf.cell?.isScrollable = false
         tf.maximumNumberOfLines = 0        // grow instead of truncating
-        tf.stringValue = "Listening…"
-        let m = LevelMeter(frame: NSRect(origin: .zero, size: LevelMeter.size))
+        tf.stringValue = ""
+        let m = LevelMeter(frame: .zero)
         m.isHidden = true
         tf.alignment = .left
         tf.autoresizingMask = [.width, .height]
@@ -457,7 +460,7 @@ final class LiveHUD {
     func show() {
         DispatchQueue.main.async {
             if self.window == nil { self.build() }
-            self.label?.stringValue = "Listening…"
+            self.label?.stringValue = ""
             self.meter?.reset()
             self.refreshBadge()
             // Poll while visible: the language can change mid-hold and there is no
@@ -509,7 +512,7 @@ final class LiveHUD {
         pendingText = nil
 
         let t = raw.trimmingCharacters(in: .whitespacesAndNewlines)
-        var display = t.isEmpty ? "Listening…" : t
+        var display = t
 
         let fits = maxHeight - padY * 2
         if heightFor(display) > fits {
@@ -540,18 +543,18 @@ final class LiveHUD {
         DispatchQueue.main.async { self.meter?.push(l) }
     }
 
-    /// The meter belongs to "Listening…" only: once words are on screen they are
-    /// the proof of hearing, and bars beside a sentence would just be noise. It
-    /// sits right after the text, on the first line, which is where the text is
-    /// drawn — the field is top-aligned.
+    /// The meter stands in for text until there is some: once words are on
+    /// screen they are the proof of hearing. It fills the caption's text area,
+    /// centred vertically in the panel.
     private func placeMeter(listening: Bool) {
         guard let m = meter, let label = label else { return }
         m.isHidden = !listening
-        guard listening, let font = label.font else { return }
-        let textW = ("Listening…" as NSString).size(withAttributes: [.font: font]).width
-        let lineH = heightFor("X")
-        m.setFrameOrigin(NSPoint(x: label.frame.minX + textW + 12,
-                                 y: label.frame.maxY - lineH / 2 - LevelMeter.size.height / 2))
+        guard listening else { return }
+        let h: CGFloat = 28
+        let panelH = window?.frame.height ?? minHeight
+        m.frame = NSRect(x: label.frame.minX, y: (panelH - h) / 2,
+                         width: label.frame.width, height: h)
+        m.needsDisplay = true
     }
 
     func hide() {
