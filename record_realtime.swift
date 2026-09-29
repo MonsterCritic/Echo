@@ -152,6 +152,41 @@ final class HUDContent: NSVisualEffectView {
     }
 }
 
+/// Five bars that move with the microphone, shown beside "Listening…" until the
+/// first words arrive.
+///
+/// With a recognition delay above minimal, text takes a couple of seconds to
+/// appear — measured at a median of 2.4s after the key goes down. For all that
+/// time "Listening…" looked exactly like a dictation that had failed. This shows,
+/// from the first buffer, that your voice is actually being heard.
+final class LevelMeter: NSView {
+    private var levels = [CGFloat](repeating: 0, count: 5)
+    private let barW: CGFloat = 3, gap: CGFloat = 3
+
+    static let size = NSSize(width: 5 * 3 + 4 * 3, height: 16)
+
+    /// 0…1. Scrolls in from the right, so the bars read as a short history
+    /// rather than five copies of the same number.
+    func push(_ level: CGFloat) {
+        levels.removeFirst()
+        levels.append(level)
+        needsDisplay = true
+    }
+
+    func reset() { levels = levels.map { _ in 0 }; needsDisplay = true }
+
+    override func draw(_ dirtyRect: NSRect) {
+        NSColor.labelColor.withAlphaComponent(0.75).setFill()
+        for (i, l) in levels.enumerated() {
+            // A floor, so silence shows as a row of dots, not as nothing.
+            let h = max(3, bounds.height * l)
+            let r = NSRect(x: CGFloat(i) * (barW + gap), y: (bounds.height - h) / 2,
+                           width: barW, height: h)
+            NSBezierPath(roundedRect: r, xRadius: barW / 2, yRadius: barW / 2).fill()
+        }
+    }
+}
+
 final class LiveHUD {
     static let shared = LiveHUD()
 
@@ -189,6 +224,7 @@ final class LiveHUD {
     private var strip: LangStrip?
     private var badgeTimer: Timer?
     private let bottomInset: CGFloat = 90
+    private var meter: LevelMeter?
 
     private func build() {
         // NSPanel, not NSWindow: .nonactivatingPanel only means anything on a panel,
@@ -231,6 +267,8 @@ final class LiveHUD {
         tf.cell?.isScrollable = false
         tf.maximumNumberOfLines = 0        // grow instead of truncating
         tf.stringValue = "Listening…"
+        let m = LevelMeter(frame: NSRect(origin: .zero, size: LevelMeter.size))
+        m.isHidden = true
         tf.alignment = .left
         tf.autoresizingMask = [.width, .height]
 
@@ -280,11 +318,13 @@ final class LiveHUD {
         micLabel = mic
 
         bg.addSubview(tf)
+        bg.addSubview(m)
         bg.addSubview(col)
         bg.clickable = col.frame
         w.contentView = bg
         window = w
         label = tf
+        meter = m
         badge = bd
         strip = col
         bgView = bg
@@ -412,6 +452,7 @@ final class LiveHUD {
         DispatchQueue.main.async {
             if self.window == nil { self.build() }
             self.label?.stringValue = "Listening…"
+            self.meter?.reset()
             self.refreshBadge()
             // Poll while visible: the language can change mid-hold and there is no
             // notification to hang this off.
@@ -429,6 +470,7 @@ final class LiveHUD {
             self.fieldSide = nil
             self.currentHeight = self.minHeight
             self.reposition(height: self.minHeight)
+            self.placeMeter(listening: true)
             self.window?.orderFrontRegardless()   // show WITHOUT taking focus
         }
     }
@@ -484,10 +526,31 @@ final class LiveHUD {
             currentHeight = h
             reposition(height: h)
         }
+        placeMeter(listening: t.isEmpty)
+    }
+
+    /// Microphone level, 0…1, from the audio tap.
+    func level(_ l: CGFloat) {
+        DispatchQueue.main.async { self.meter?.push(l) }
+    }
+
+    /// The meter belongs to "Listening…" only: once words are on screen they are
+    /// the proof of hearing, and bars beside a sentence would just be noise. It
+    /// sits right after the text, on the first line, which is where the text is
+    /// drawn — the field is top-aligned.
+    private func placeMeter(listening: Bool) {
+        guard let m = meter, let label = label else { return }
+        m.isHidden = !listening
+        guard listening, let font = label.font else { return }
+        let textW = ("Listening…" as NSString).size(withAttributes: [.font: font]).width
+        let lineH = heightFor("X")
+        m.setFrameOrigin(NSPoint(x: label.frame.minX + textW + 12,
+                                 y: label.frame.maxY - lineH / 2 - LevelMeter.size.height / 2))
     }
 
     func hide() {
         DispatchQueue.main.async {
+            self.meter?.reset()
             self.badgeTimer?.invalidate()
             self.badgeTimer = nil
             self.window?.orderOut(nil)
@@ -824,6 +887,27 @@ final class RealtimeSession {
             break
         }
     }
+}
+
+/// Loudest meter reading this recording — logged on stop, so a meter that never
+/// moves can be told from a quiet room.
+var meterPeak: CGFloat = 0
+
+/// Loudness of the converted audio mapped to 0…1 for the meter: -50 dBFS (room
+/// hush) is empty, -12 dBFS (normal speech close to the mic) is full.
+///
+/// Measured on the 16-bit PCM that is actually sent, not the device buffer: the
+/// device's own format varies (it read as silence on this Mac, every time), while
+/// this one is fixed — and it is exactly what the recogniser hears.
+func micLevel(_ pcm: Data) -> CGFloat {
+    let n = pcm.count / 2
+    guard n > 0 else { return 0 }
+    var sum: Double = 0
+    pcm.withUnsafeBytes { raw in
+        for v in raw.bindMemory(to: Int16.self) { let f = Double(v) / 32768; sum += f * f }
+    }
+    let db = 20 * log10(max(sqrt(sum / Double(n)), 1e-7))
+    return CGFloat(min(max((db + 50) / 38, 0), 1))
 }
 
 // ── Vocabulary (edited from the menubar) ─────────────────────────────────────
@@ -1212,6 +1296,9 @@ func startRecording() {
                 }
             }
         }
+        let lvl = micLevel(pcm)
+        meterPeak = max(meterPeak, lvl)
+        LiveHUD.shared.level(lvl)
         session?.sendAudio(pcm)
         stateLock.lock(); sentBytes += pcm.count; stateLock.unlock()
     }
@@ -1270,7 +1357,9 @@ func stopRecording() {
 
     engine.inputNode.removeTap(onBus: 0)
     engine.stop()
-    log("stopped — streamed \(bytes) bytes of PCM")
+    log("stopped — streamed \(bytes) bytes of PCM"
+        + String(format: "  (meter peak %.2f)", Double(meterPeak)))
+    meterPeak = 0
     guard let s = session else { return }
     // Committing an empty buffer is an API error; skip it and hand off empty.
     if bytes < 4800 {          // < 100ms at 24kHz/16-bit
