@@ -51,6 +51,8 @@ AWAIT_PID    = "/tmp/rewrite_await_field.pid"
 # otherwise fight over the microphone.
 REALTIME_MODE   = True
 TRANSCRIPT_PATH = "/tmp/rewrite_transcript.txt"
+# Written by the recorder at release: the text as it stood then. See EarlyTranslation.
+PROVISIONAL_PATH = "/tmp/rewrite_transcript.provisional"
 
 # Active path: ONE call to /v1/audio/translations (whisper-1) that transcribes
 # AND translates to English in a single round-trip — halves API latency vs the
@@ -242,7 +244,7 @@ def load_env(name: str) -> str | None:
 
 # ── Daemon coordination ───────────────────────────────────────────────────────
 
-def wait_for_release(timeout_s: float = 120.0) -> bool:
+def wait_for_release(timeout_s: float = 120.0, while_finishing=None) -> bool:
     """Block until the user releases the key and the recorder has flushed.
 
     The clean "released" signal is: ready flag present AND start flag absent.
@@ -253,8 +255,12 @@ def wait_for_release(timeout_s: float = 120.0) -> bool:
     dictation happened)."""
     deadline = time.time() + timeout_s
     while time.time() < deadline:
-        if os.path.exists(READY_FLAG) and not os.path.exists(START_FLAG):
+        released = not os.path.exists(START_FLAG)
+        if released and os.path.exists(READY_FLAG):
             return True
+        # Released, but the recorder is still waiting for the final transcript.
+        if released and while_finishing:
+            while_finishing()
         time.sleep(0.03)
     return False
 
@@ -1016,7 +1022,43 @@ def read_realtime_transcript(timeout_s: float = 6.0) -> str:
     return ""
 
 
-def process_dictation(t0: float):
+def _same_text(a: str, b: str) -> bool:
+    """Equal apart from whitespace — the caption marks pauses with line breaks."""
+    return "".join(a.split()) == "".join(b.split())
+
+
+class EarlyTranslation:
+    """Translate the text as it stood at release, while the recorder is still
+    waiting for the final transcript.
+
+    That wait takes ~0.8s and translation could not start until it ended. In 56%
+    of dictations (154 of 273 measured) the text at release already was the final
+    transcript, so for those the translation can start 0.8s sooner. When the final
+    text differs, this result is simply thrown away and the final one translated
+    as before — never slower than not trying, at the cost of one extra call.
+    """
+
+    def __init__(self, text: str, api_key: str):
+        self.text = text
+        self.lang = output_language()   # a switch after this makes the result stale
+        self.started = time.monotonic()
+        self.result: str | None = None
+        self.error: Exception | None = None
+        self._thread = threading.Thread(target=self._run, args=(api_key,), daemon=True)
+        self._thread.start()
+
+    def _run(self, api_key: str):
+        try:
+            self.result = prettify(self.text, api_key)
+        except Exception as e:
+            self.error = e
+
+    def wait(self, timeout: float = 60.0) -> str | None:
+        self._thread.join(timeout)
+        return self.result if self.error is None else None
+
+
+def process_dictation(t0: float, early: EarlyTranslation | None = None):
     """Run the pipeline once the recorder has signalled ready (flag already
     consumed by the caller). t0 is the monotonic clock at the moment the
     recording stopped, for latency logging.
@@ -1057,8 +1099,20 @@ def process_dictation(t0: float):
             # Transcription already happened during the hold; just translate
             # + tidy the text (prettify handles non-English → English).
             raw = spoken
-            log(f"Translating…  [+{time.monotonic()-t0:.2f}s]")
-            clean = prettify(raw, openai_key)
+            clean = None
+            if early and _same_text(early.text, raw) and early.lang == output_language():
+                clean = early.wait()
+                if clean is not None:
+                    log(f"early translation matched the final transcript — used it "
+                        f"(started {t0 - early.started:.2f}s before the transcript was final)")
+                else:
+                    log(f"early translation failed ({early.error}) — translating again")
+            elif early:
+                log(f"final transcript differs from the text at release "
+                    f"({len(early.text)} → {len(raw)} chars) — translating the final")
+            if clean is None:
+                log(f"Translating…  [+{time.monotonic()-t0:.2f}s]")
+                clean = prettify(raw, openai_key)
             log(f"Final: {repr(clean)}  [+{time.monotonic()-t0:.2f}s]")
             if not clean.strip():
                 log("Empty result")
@@ -1120,7 +1174,27 @@ def main():
     # Block until release. Timeout is generous because it spans the entire
     # hold; a real hold is seconds, and if nothing arrives the user never
     # actually dictated, so we just exit.
-    if not wait_for_release(timeout_s=120.0):
+    # Start translating as soon as the recorder publishes the text at release,
+    # instead of after it has confirmed the final transcript.
+    early: list[EarlyTranslation] = []
+    launched = time.time()
+    key_for_early = load_env("OPENAI_API_KEY") if REALTIME_MODE else None
+
+    def start_early():
+        if early or not key_for_early:
+            return
+        try:
+            if os.path.getmtime(PROVISIONAL_PATH) < launched - 1:
+                return               # left over from an earlier hold
+            with open(PROVISIONAL_PATH) as f:
+                text = f.read().strip()
+        except OSError:
+            return
+        if text:
+            early.append(EarlyTranslation(text, key_for_early))
+            log(f"released — translating the text at release early ({len(text)} chars)")
+
+    if not wait_for_release(timeout_s=120.0, while_finishing=start_early):
         log("no recording within 120s — exiting")
         stop_focus_capture()
         return
@@ -1140,7 +1214,7 @@ def main():
     try: os.remove(READY_FLAG)
     except Exception: pass
 
-    process_dictation(t0)
+    process_dictation(t0, early[0] if early else None)
 
 
 if __name__ == "__main__":

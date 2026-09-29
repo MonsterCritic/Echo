@@ -36,6 +36,11 @@ _ = activityToken
 let startFlag      = "/tmp/rewrite_record_start"
 let readyFlag      = "/tmp/rewrite_record.ready"
 let transcriptPath = "/tmp/rewrite_transcript.txt"
+// The text as it stood at release, written before the final transcript exists.
+// dictate.py starts translating it straight away; if the final transcript turns
+// out the same — measured at 56% of dictations — that translation is used and
+// the wait for the server no longer sits in front of it.
+let provisionalPath = "/tmp/rewrite_transcript.provisional"
 let logPath        = "/tmp/record_realtime.log"
 
 // One append-mode descriptor, held open, writes serialised by a lock.
@@ -1225,6 +1230,7 @@ func startRecording() {
 
     try? FileManager.default.removeItem(atPath: readyFlag)
     try? FileManager.default.removeItem(atPath: transcriptPath)
+    try? FileManager.default.removeItem(atPath: provisionalPath)
 
     // The HUD is deliberately NOT shown here. It used to appear the moment the
     // key went down, but everything below still has to happen first — the
@@ -1436,6 +1442,10 @@ func stopRecording() {
         // text below, because this is the number that says how much of a
         // dictation only arrives AFTER release.
         let deltaAtRelease = s.textsNow().delta
+        let early = deltaAtRelease.trimmingCharacters(in: .whitespacesAndNewlines)
+        if !early.isEmpty {
+            try? early.write(toFile: provisionalPath, atomically: true, encoding: .utf8)
+        }
 
         // Wait for the trailing commit to register, rather than sleeping a flat
         // 250ms for it. Until it does, "all segments transcribed" is trivially
