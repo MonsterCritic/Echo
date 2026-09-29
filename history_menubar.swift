@@ -568,12 +568,13 @@ class StatusController: NSObject, NSMenuDelegate {
             item.target = self
             item.representedObject = code
             item.state = (code == tier) ? .on : .off
-            item.toolTip = "How much speech the model hears before it commits words. "
-                         + "Lower shows text sooner; higher identifies the language better."
+            item.toolTip = "How much speech the model hears before it commits words — "
+                         + "higher is more accurate. Only affects the pasted text: the live "
+                         + "caption always uses a separate, fastest recogniser."
             delayMenu.addItem(item)
         }
         delayMenu.addItem(NSMenuItem.separator())
-        let delayNote = NSMenuItem(title: "Applies to the next dictation",
+        let delayNote = NSMenuItem(title: "Accuracy of the pasted text · caption is always fast",
                                    action: nil, keyEquivalent: "")
         delayNote.isEnabled = false
         delayMenu.addItem(delayNote)

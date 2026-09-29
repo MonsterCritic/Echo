@@ -337,6 +337,7 @@ final class LiveHUD {
     /// Discard what has been transcribed so far, without stopping the recording.
     func clearTranscript() {
         session?.clearSoFar()
+        previewSession?.clearSoFar()
     }
 
     /// Flip the language from the caption itself. Writes the same file the menubar
@@ -602,7 +603,15 @@ final class RealtimeSession {
     // menubar and apply to the next hold. Only the speaker can judge this trade.
     static let validDelays = ["minimal", "low", "medium", "high", "xhigh"]
     static let defaultDelay = "low"
-    let delay = transcribeDelay()
+    let delay: String
+
+    /// A preview session exists only to put words on screen quickly: it runs at
+    /// "minimal" alongside the main session, on the same audio, and its text is
+    /// never pasted. The main session keeps the slower, more accurate tier the
+    /// speaker chose, and its transcript is what gets handed off. So the caption
+    /// no longer has to wait for accuracy, and accuracy no longer has to be traded
+    /// for a caption that keeps up.
+    let isPreview: Bool
 
     // Told to the model as context, which is why this string is Russian: it is
     // functional input to an acoustic model, not copy anyone reads. Priming with
@@ -668,7 +677,9 @@ final class RealtimeSession {
     static let pauseBreakSeconds = 2.5
     private var lastDeltaAt: Date? = nil
 
-    init(key: String) {
+    init(key: String, preview: Bool = false) {
+        isPreview = preview
+        delay = preview ? "minimal" : transcribeDelay()
         let url = URL(string: "wss://api.openai.com/v1/realtime?intent=transcription")!
         var req = URLRequest(url: url)
         req.setValue("Bearer \(key)", forHTTPHeaderField: "Authorization")
@@ -800,7 +811,10 @@ final class RealtimeSession {
             guard let self = self else { return }
             switch result {
             case .failure(let e):
-                log("recv error: \(e)")
+                log("recv error\(self.isPreview ? " (preview)" : ""): \(e)")
+                // A dead preview must not leave the caption empty: hand the
+                // caption back to the main session, which still streams deltas.
+                if self.isPreview { captionFromPreview = false }
             case .success(let msg):
                 if case .string(let s) = msg { self.handle(s) }
                 self.receive()
@@ -867,10 +881,14 @@ final class RealtimeSession {
             lastActivity = Date()
             let live = deltaText
             lock.unlock()
+            // Exactly one session drives the caption: the preview while it is
+            // alive, the main session otherwise. Both logging first text keeps the
+            // two latencies comparable.
             if isFirstText {
                 let ms = Int(-recordingStartedAt.timeIntervalSinceNow * 1000)
-                log("caption: first text \(ms)ms after press (delay: \(delay))")
+                log("caption: first text \(ms)ms after press (delay: \(delay)\(isPreview ? ", preview" : ""))")
             }
+            guard isPreview == captionFromPreview else { return }
             if isBreak { log(String(format: "caption: pause %.2fs → break", gap)) }
             LiveHUD.shared.update(live)
         case "error":
@@ -1150,6 +1168,16 @@ func pinInputDevice() {
 let engine = AVAudioEngine()
 var converter: AVAudioConverter?
 var session: RealtimeSession?
+/// The fast session behind the live caption. See RealtimeSession.isPreview.
+var previewSession: RealtimeSession?
+/// Whether the caption follows the preview (normally) or the main session (if
+/// the preview could not be opened or dropped).
+var captionFromPreview = false
+
+func closePreview() {
+    previewSession?.close()
+    previewSession = nil
+}
 let targetFormat = AVAudioFormat(commonFormat: .pcmFormatInt16, sampleRate: 24000,
                                  channels: 1, interleaved: true)!
 
@@ -1211,6 +1239,10 @@ func startRecording() {
     let s = RealtimeSession(key: apiKey)
     s.start()
     session = s
+    let pv = RealtimeSession(key: apiKey, preview: true)
+    pv.start()
+    previewSession = pv
+    captionFromPreview = true
 
     // Don't read the input format until the device pin has settled — doing so
     // mid-pin picked up a stale format and the tap then produced no audio at all.
@@ -1235,7 +1267,7 @@ func startRecording() {
         LiveHUD.shared.hide()
         try? "".write(toFile: transcriptPath, atomically: true, encoding: .utf8)
         FileManager.default.createFile(atPath: readyFlag, contents: Data())
-        s.close(); session = nil
+        s.close(); session = nil; closePreview()
         return
     }
 
@@ -1300,6 +1332,7 @@ func startRecording() {
         meterPeak = max(meterPeak, lvl)
         LiveHUD.shared.level(lvl)
         session?.sendAudio(pcm)
+        previewSession?.sendAudio(pcm)
         stateLock.lock(); sentBytes += pcm.count; stateLock.unlock()
     }
     }
@@ -1367,7 +1400,7 @@ func stopRecording() {
         LiveHUD.shared.hide()
         try? "".write(toFile: transcriptPath, atomically: true, encoding: .utf8)
         FileManager.default.createFile(atPath: readyFlag, contents: Data())
-        s.close(); session = nil
+        s.close(); session = nil; closePreview()
 
         // Nothing at all, from a hold long enough that there should have been
         // something. A brief tap is not evidence of anything, so it doesn't count.
@@ -1386,12 +1419,16 @@ func stopRecording() {
     }
     deadCaptures = 0
     s.commit()
+    // The preview commits too, so its last words reach the caption while the main
+    // session finishes; it is closed with the handoff.
+    previewSession?.commit()
 
     // Wait for EVERY committed utterance to come back transcribed before handing
     // off. The previous heuristic ("transcript stopped growing and went quiet")
     // bailed ~150ms after release whenever the user had paused, silently losing
     // the tail of the dictation. Now we wait on the actual segment count.
     let committedBefore = s.segmentCounts().committed
+    let pv = previewSession
     DispatchQueue.global().async {
         let began = Date()
 
@@ -1449,8 +1486,10 @@ func stopRecording() {
         // translate + paste take over.
         LiveHUD.shared.hide()
         s.close()
+        pv?.close()
     }
     session = nil
+    previewSession = nil
 }
 
 // ── Poll loop (same trigger as record.swift) ─────────────────────────────────
