@@ -1153,6 +1153,15 @@ def process_dictation(t0: float, early: EarlyTranslation | None = None):
         log(f"realtime transcript: {len(spoken)} chars  [+{time.monotonic()-t0:.2f}s]")
         if not spoken:
             log("Empty realtime transcript — nothing to paste")
+            # The recorder writes this when the API refused the recording outright
+            # (no credits, bad key). Say so, instead of a silent empty result.
+            try:
+                with open("/tmp/rewrite_api_error") as f:
+                    why = f.read().strip()
+                if why:
+                    notify("Dictation failed", why)
+            except OSError:
+                pass
             return
     else:
         if not os.path.exists(AUDIO_PATH):

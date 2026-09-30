@@ -480,6 +480,7 @@ final class LiveHUD {
             self.currentHeight = self.minHeight
             self.reposition(height: self.minHeight)
             self.placeMeter(listening: true)
+            self.applyError()                      // it may have arrived before the caption
             self.window?.orderFrontRegardless()   // show WITHOUT taking focus
         }
     }
@@ -510,6 +511,7 @@ final class LiveHUD {
         flushQueued = false
         guard let raw = pendingText, let label = label else { return }
         pendingText = nil
+        if errorText != nil { return }
 
         let t = raw.trimmingCharacters(in: .whitespacesAndNewlines)
         var display = t
@@ -536,6 +538,35 @@ final class LiveHUD {
             reposition(height: h)
         }
         placeMeter(listening: t.isEmpty)
+    }
+
+    /// Set when the API refused this recording outright. Shown instead of the
+    /// meter and never overwritten by an (empty) caption until the next hold.
+    private var errorText: String?
+
+    func showError(_ msg: String) {
+        DispatchQueue.main.async {
+            guard self.errorText == nil else { return }
+            self.errorText = msg
+            self.applyError()
+        }
+    }
+
+    func clearError() {
+        DispatchQueue.main.async {
+            self.errorText = nil
+            self.label?.textColor = .labelColor
+        }
+    }
+
+    private func applyError() {
+        guard let msg = errorText, let label = label else { return }
+        meter?.isHidden = true
+        label.textColor = .systemRed
+        label.stringValue = msg
+        let h = min(max(heightFor(msg) + padY * 2, minHeight), maxHeight)
+        currentHeight = h
+        reposition(height: h)
     }
 
     /// Microphone level, 0…1, from the audio tap.
@@ -908,6 +939,13 @@ final class RealtimeSession {
                 log("final commit had nothing left (VAD already committed) — ok")
             } else {
                 log("API error: \(s)")
+                // Errors that mean nothing will come back at all are shown, not just
+                // logged: otherwise the caption simply stays empty and it looks like
+                // the microphone. Both sessions report it; the first one wins.
+                if let msg = accountErrorMessage(s) {
+                    LiveHUD.shared.showError(msg)
+                    try? msg.write(toFile: apiErrorPath, atomically: true, encoding: .utf8)
+                }
             }
         default:
             break
@@ -934,6 +972,22 @@ func micLevel(_ pcm: Data) -> CGFloat {
     }
     let db = 20 * log10(max(sqrt(sum / Double(n)), 1e-7))
     return CGFloat(min(max((db + 50) / 38, 0), 1))
+}
+
+/// Written when the API refuses a recording, so dictate.py can say why nothing
+/// was pasted rather than just logging an empty transcript.
+let apiErrorPath = "/tmp/rewrite_api_error"
+
+/// A plain-English message for API errors that mean no text will ever arrive:
+/// the account is out of credits, or the key is wrong. nil for anything else.
+func accountErrorMessage(_ raw: String) -> String? {
+    if raw.contains("insufficient_quota") || raw.contains("credit_balance_exhausted") {
+        return "OpenAI credits exhausted — add credits at platform.openai.com → Billing"
+    }
+    if raw.contains("invalid_api_key") {
+        return "OpenAI rejected the API key — check it in Echo's settings"
+    }
+    return nil
 }
 
 // ── Vocabulary (edited from the menubar) ─────────────────────────────────────
@@ -1243,6 +1297,8 @@ func startRecording() {
     // wasn't open yet. It now appears from the audio tap on the first buffer that
     // actually reaches us, so the HUD being visible means we really are listening.
     let pressedAt = Date()
+    LiveHUD.shared.clearError()
+    try? FileManager.default.removeItem(atPath: apiErrorPath)
     recordingStartedAt = pressedAt
 
     let s = RealtimeSession(key: apiKey)
