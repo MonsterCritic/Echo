@@ -384,6 +384,81 @@ if let i = args.firstIndex(of: "--await-field") {
     AwaitField.run(seconds: seconds, preview: preview)
 }
 
+// --pin-chat <path>: remember the Claude Code chat whose message box has focus.
+//   exit 0 — written to <path> as {"url","title"}; stdout the title
+//   exit 3 — focus is not inside a Claude chat
+//
+// A chat is identified by its web area's address, claude.ai/epitaxy/<session>,
+// which is stable for the chat's life — unlike the text box element, which the
+// app rebuilds whenever the chat is switched away from and back.
+if let i = args.firstIndex(of: "--pin-chat"), i + 1 < args.count {
+    guard trusted else { FileHandle.standardError.write("ACCESSIBILITY_NOT_GRANTED\n".data(using: .utf8)!); exit(2) }
+    guard let el = focusedElement(), let (url, title) = enclosingChat(of: el) else {
+        FileHandle.standardError.write("NOT_IN_A_CLAUDE_CHAT\n".data(using: .utf8)!)
+        exit(3)
+    }
+    let json = try! JSONSerialization.data(withJSONObject: ["url": url, "title": title])
+    try? json.write(to: URL(fileURLWithPath: args[i + 1]), options: .atomic)
+    print(title)
+    exit(0)
+}
+
+// --send-to-chat <url>: paste the clipboard into that chat's message box, press
+// Return, then give focus back to wherever it was.
+//   exit 0 — sent
+//   exit 3 — the chat is not on screen in any Claude window (stderr says why)
+//
+// The clipboard already holds the text; the caller restores it afterwards.
+if let i = args.firstIndex(of: "--send-to-chat"), i + 1 < args.count {
+    guard trusted else { FileHandle.standardError.write("ACCESSIBILITY_NOT_GRANTED\n".data(using: .utf8)!); exit(2) }
+    let wanted = args[i + 1]
+    guard let claude = NSWorkspace.shared.runningApplications.first(where: {
+              $0.bundleIdentifier == "com.anthropic.claudefordesktop" }) else {
+        FileHandle.standardError.write("CLAUDE_NOT_RUNNING\n".data(using: .utf8)!); exit(3)
+    }
+    let pid = claude.processIdentifier
+    let appEl = AXUIElementCreateApplication(pid)
+    enableAX(appEl, pid)
+    guard let (window, box) = findChatBox(in: appEl, url: wanted) else {
+        FileHandle.standardError.write("CHAT_NOT_ON_SCREEN\n".data(using: .utf8)!); exit(3)
+    }
+    if args.contains("--dry") { print("FOUND"); exit(0) }   // lookup only, for testing
+
+    // Where to come back to.
+    let prevApp = NSWorkspace.shared.frontmostApplication
+    let prevField = focusedElement()
+
+    if !claude.isActive { claude.activate(options: [.activateIgnoringOtherApps]); usleep(200_000) }
+    AXUIElementPerformAction(window, kAXRaiseAction as CFString)
+    AXUIElementSetAttributeValue(window, kAXMainAttribute as CFString, kCFBooleanTrue)
+    usleep(100_000)
+    AXUIElementSetAttributeValue(box, kAXFocusedAttribute as CFString, kCFBooleanTrue)
+    usleep(150_000)
+    guard let now = focusedElement(pid: pid), CFEqual(now, box) else {
+        FileHandle.standardError.write("COULD_NOT_FOCUS_THE_BOX\n".data(using: .utf8)!); exit(3)
+    }
+    // Append after whatever is already typed there rather than replacing it.
+    if let v = axAttr(box, kAXNumberOfCharactersAttribute as String) as? Int {
+        var r = CFRange(location: v, length: 0)
+        if let end = AXValueCreate(.cfRange, &r) {
+            AXUIElementSetAttributeValue(box, kAXSelectedTextRangeAttribute as CFString, end)
+        }
+    }
+    postKey(0x09, command: true)      // Cmd+V
+    usleep(250_000)                   // let the editor take the paste before submitting
+    postKey(0x24, command: false)     // Return
+    usleep(200_000)
+
+    if let prev = prevApp, prev.processIdentifier != pid {
+        prev.activate(options: [.activateIgnoringOtherApps])
+        usleep(150_000)
+    }
+    if let f = prevField, !CFEqual(f, box) {
+        AXUIElementSetAttributeValue(f, kAXFocusedAttribute as CFString, kCFBooleanTrue)
+    }
+    exit(0)
+}
+
 print(frontBefore)   // stdout → caller logs this
 
 if !trusted {
@@ -567,4 +642,63 @@ enum AwaitField {
         }
         panel = p
     }
+}
+
+
+// ── Claude chats (--pin-chat, --send-to-chat) ────────────────────────────────
+/// The chat an element sits in: the nearest web area whose address is a Claude
+/// Code session, with its title minus the " - Claude Code" suffix.
+func enclosingChat(of el: AXUIElement) -> (String, String)? {
+    var cur: AXUIElement? = el
+    for _ in 0..<60 {
+        guard let c = cur else { return nil }
+        if (axAttr(c, kAXRoleAttribute as String) as? String) == "AXWebArea",
+           let url = axAttr(c, "AXURL").map({ "\($0)" }), url.contains("/epitaxy/") {
+            var title = (axAttr(c, kAXTitleAttribute as String) as? String) ?? "Claude chat"
+            if title.hasSuffix(" - Claude Code") { title = String(title.dropLast(14)) }
+            return (url, title)
+        }
+        cur = axAttr(c, kAXParentAttribute as String).map { $0 as! AXUIElement }
+    }
+    return nil
+}
+
+/// The window and message box of the chat at `url`, if it is on screen.
+func findChatBox(in app: AXUIElement, url: String) -> (AXUIElement, AXUIElement)? {
+    for w in (axAttr(app, kAXWindowsAttribute as String) as? [AXUIElement]) ?? [] {
+        var queue = [w]
+        var seen = 0
+        while !queue.isEmpty && seen < 40_000 {
+            let e = queue.removeFirst(); seen += 1
+            if (axAttr(e, kAXRoleAttribute as String) as? String) == "AXWebArea",
+               axAttr(e, "AXURL").map({ "\($0)" }) == url {
+                // The message box is this chat's own "Prompt" text area.
+                var inner = [e]; var n = 0
+                while !inner.isEmpty && n < 40_000 {
+                    let x = inner.removeFirst(); n += 1
+                    if (axAttr(x, kAXRoleAttribute as String) as? String) == "AXTextArea",
+                       (axAttr(x, kAXDescriptionAttribute as String) as? String) == "Prompt" {
+                        return (w, x)
+                    }
+                    if let k = axAttr(x, kAXChildrenAttribute as String) as? [AXUIElement] { inner += k }
+                }
+                return nil
+            }
+            if let k = axAttr(e, kAXChildrenAttribute as String) as? [AXUIElement] { queue += k }
+        }
+    }
+    return nil
+}
+
+/// One key press, with an explicit Command down/up around it when asked —
+/// Electron apps ignore the flag-only form.
+func postKey(_ key: CGKeyCode, command: Bool) {
+    let src = CGEventSource(stateID: .combinedSessionState)
+    if command { CGEvent(keyboardEventSource: src, virtualKey: 0x37, keyDown: true)?.post(tap: .cghidEventTap); usleep(8_000) }
+    let down = CGEvent(keyboardEventSource: src, virtualKey: key, keyDown: true)
+    let up = CGEvent(keyboardEventSource: src, virtualKey: key, keyDown: false)
+    if command { down?.flags = .maskCommand; up?.flags = .maskCommand }
+    down?.post(tap: .cghidEventTap); usleep(8_000)
+    up?.post(tap: .cghidEventTap); usleep(8_000)
+    if command { CGEvent(keyboardEventSource: src, virtualKey: 0x37, keyDown: false)?.post(tap: .cghidEventTap) }
 }

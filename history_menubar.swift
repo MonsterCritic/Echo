@@ -173,6 +173,11 @@ func setPastedLanguage(_ code: String) {
 let vocabularyFile = NSString(string: "~/Library/Application Support/Echo/vocabulary.json")
                      .expandingTildeInPath
 
+/// The Claude Code chat that "message for Claude" dictations go to. Written by
+/// dictate.py when "pin this chat" is dictated.
+let pinnedChatFile = NSString(string: "~/Library/Application Support/Echo/pinned_chat.json")
+                     .expandingTildeInPath
+
 struct VocabWord {
     var word: String
     var heardAs: [String]
@@ -582,6 +587,33 @@ class StatusController: NSObject, NSMenuDelegate {
         delayRoot.submenu = delayMenu
         menu.addItem(delayRoot)
 
+        // ── Pinned Claude chat ───────────────────────────────────────────────
+        // Pinned by voice ("pin this chat") because only the dictation helper
+        // has the Accessibility access to read which chat has focus; the menu
+        // shows the result and can clear it.
+        let pinned = (FileManager.default.contents(atPath: pinnedChatFile))
+            .flatMap { try? JSONSerialization.jsonObject(with: $0) as? [String: Any] }
+        let chatRoot = NSMenuItem(title: (pinned?["title"] as? String).map { "Claude chat: \($0)" }
+                                         ?? "Claude chat: none pinned",
+                                  action: nil, keyEquivalent: "")
+        let chatMenu = NSMenu()
+        if pinned != nil {
+            let unpin = NSMenuItem(title: "Unpin", action: #selector(unpinChat), keyEquivalent: "")
+            unpin.target = self
+            chatMenu.addItem(unpin)
+            chatMenu.addItem(NSMenuItem.separator())
+        }
+        for line in ["To pin: click into a chat's message box,",
+                     "dictate “pin this chat”.",
+                     "To send: start a dictation with",
+                     "“message for Claude”."] {
+            let note = NSMenuItem(title: line, action: nil, keyEquivalent: "")
+            note.isEnabled = false
+            chatMenu.addItem(note)
+        }
+        chatRoot.submenu = chatMenu
+        menu.addItem(chatRoot)
+
         // ── Vocabulary ───────────────────────────────────────────────────────
         let words = loadVocabulary()
         let vocabRoot = NSMenuItem(title: words.isEmpty ? "Vocabulary" : "Vocabulary (\(words.count))",
@@ -749,6 +781,10 @@ class StatusController: NSObject, NSMenuDelegate {
     @objc func pickLanguage(_ sender: NSMenuItem) {
         guard let code = sender.representedObject as? String else { return }
         setPastedLanguage(code)
+    }
+
+    @objc func unpinChat() {
+        try? FileManager.default.removeItem(atPath: pinnedChatFile)
     }
 
     @objc func addWord() {

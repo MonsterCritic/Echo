@@ -384,7 +384,7 @@ def looks_untranslated(text: str) -> bool:
     return len(CYRILLIC_RE.findall(text)) > 3
 
 
-def prettify(text: str, api_key: str) -> str:
+def prettify(text: str, api_key: str, force_english: bool = False) -> str:
     """OpenAI: translate to English if needed, then prettify.
 
     Verified afterwards rather than trusted. Across 167 logged dictations the
@@ -395,7 +395,7 @@ def prettify(text: str, api_key: str) -> str:
     without weakening the voice commands, which are still honored because the
     retry is skipped whenever the speaker actually asked for the original.
     """
-    if output_language() == "ru":
+    if output_language() == "ru" and not force_english:
         # Nothing to verify here: Russian output is the point, so the
         # translation backstop below would be actively wrong.
         log("pasted language is Russian — tidying without translating")
@@ -1022,6 +1022,82 @@ def read_realtime_transcript(timeout_s: float = 6.0) -> str:
     return ""
 
 
+# ── Messages to a pinned Claude chat ─────────────────────────────────────────
+# "Pin this chat", said with focus in a Claude Code chat's message box, remembers
+# that chat. A dictation that then starts with "message for Claude" is translated
+# into English, typed into that chat and submitted — from any app, without
+# switching to it first. The chat is found by its address, so it survives
+# switching chats in between; it has to be on screen somewhere to be typed into.
+PINNED_CHAT = os.path.expanduser("~/Library/Application Support/Echo/pinned_chat.json")
+
+# Spoken in Russian or English; the recogniser transcribes as Russian, so the
+# English phrase arrives transliterated as often as not.
+SEND_TO_CHAT_RE = re.compile(
+    r"^\W*(?:сообщени[еяю]|месс?[еэа]дж|message)\s+(?:для\s+|for\s+|фор\s+)?"
+    r"(?:клод\w*|клауд\w*|клоуд\w*|claude)\b\W*", re.IGNORECASE)
+PIN_CHAT_RE = re.compile(
+    r"^\W*(?:закреп[иь]|запин\w*|пин|pin)\s+(?:этот\s+|this\s+|the\s+)?(?:чат|chat)\W*$",
+    re.IGNORECASE)
+
+
+def pin_chat():
+    """Remember the Claude chat whose message box has focus."""
+    stop_focus_capture()
+    reset_output_language()
+    try:
+        r = subprocess.run([PASTE_HELPER, "--pin-chat", PINNED_CHAT],
+                           capture_output=True, text=True, timeout=10)
+    except Exception as e:
+        log(f"pin failed: {e}")
+        return
+    if r.returncode == 0:
+        title = r.stdout.strip()
+        log(f"pinned Claude chat: {title}")
+        notify("Chat pinned", f"\u201C{title}\u201D — start a dictation with \u201Cmessage for Claude\u201D to send to it.")
+    else:
+        log(f"pin refused: {r.stderr.strip()}")
+        notify("Nothing pinned", "Click into a Claude Code chat's message box, then say \u201Cpin this chat\u201D.")
+
+
+def send_to_pinned_chat(raw: str, clean: str, t0: float):
+    """Type `clean` into the pinned chat and submit it."""
+    reset_output_language()
+    try:
+        prepend_history(raw, clean)
+    except Exception as e:
+        log(f"history write failed: {e}")
+    cancel_pending_insert()
+    stop_focus_capture()
+    try:
+        with open(PINNED_CHAT) as f:
+            pinned = json.load(f)
+    except (OSError, ValueError):
+        pinned = None
+    if not pinned or not pinned.get("url"):
+        write_clipboard(clean)
+        log("message for Claude, but no chat is pinned — left on the clipboard")
+        notify("No chat pinned", "Say \u201Cpin this chat\u201D in a Claude chat first. The message is on the clipboard.")
+        return
+
+    saved = read_clipboard()
+    write_clipboard(clean)
+    try:
+        r = subprocess.run([PASTE_HELPER, "--send-to-chat", pinned["url"]],
+                           capture_output=True, text=True, timeout=15)
+        ok, why = r.returncode == 0, r.stderr.strip()
+    except Exception as e:
+        ok, why = False, str(e)
+    title = pinned.get("title", "the pinned chat")
+    if ok:
+        log(f"sent to Claude chat \u201C{title}\u201D  [+{time.monotonic()-t0:.2f}s]")
+        threading.Thread(target=_delayed_restore, args=(saved, clean)).start()
+        return
+    log(f"could not send to \u201C{title}\u201D ({why}) — left on the clipboard")
+    notify("Message not sent",
+           f"\u201C{title}\u201D isn't on screen. The message is on the clipboard."
+           if "NOT_ON_SCREEN" in why else "The message is on the clipboard.")
+
+
 def _same_text(a: str, b: str) -> bool:
     """Equal apart from whitespace — the caption marks pauses with line breaks."""
     return "".join(a.split()) == "".join(b.split())
@@ -1099,6 +1175,19 @@ def process_dictation(t0: float, early: EarlyTranslation | None = None):
             # Transcription already happened during the hold; just translate
             # + tidy the text (prettify handles non-English → English).
             raw = spoken
+            if PIN_CHAT_RE.match(raw.strip()):
+                log("voice command: pin this chat")
+                pin_chat()
+                return
+            m = SEND_TO_CHAT_RE.match(raw)
+            if m and raw[m.end():].strip():
+                body = raw[m.end():].strip()
+                log(f"voice command: message for Claude ({len(body)} chars)")
+                clean = prettify(body, openai_key, force_english=True)
+                log(f"Final: {repr(clean)}  [+{time.monotonic()-t0:.2f}s]")
+                if clean.strip():
+                    send_to_pinned_chat(raw, clean, t0)
+                return
             clean = None
             if early and _same_text(early.text, raw) and early.lang == output_language():
                 clean = early.wait()
