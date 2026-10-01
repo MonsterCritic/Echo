@@ -715,10 +715,10 @@ final class RealtimeSession {
     // gap between them and keeps the 18% that look deliberate.
     // Raised from 2.5s and softened from a blank line to a single line break:
     // the caption is three lines tall, and a blank line spent a third of it on
-    // what was usually an ordinary breath. Only a long, deliberate pause earns a
+    // what was usually an ordinary breath. Only a pause of 3s or more earns a
     // new line now. The pasted text is unaffected — the translate step
     // paragraphs it by meaning.
-    static let pauseBreakSeconds = 4.0
+    static let pauseBreakSeconds = 3.0
     private var lastDeltaAt: Date? = nil
 
     init(key: String, preview: Bool = false) {
