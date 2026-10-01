@@ -713,7 +713,12 @@ final class RealtimeSession {
     // speaker actually meant. 1.2s sliced through the middle of the first one, so
     // the caption broke mid-sentence while dictating normally. 2.5s sits in the
     // gap between them and keeps the 18% that look deliberate.
-    static let pauseBreakSeconds = 2.5
+    // Raised from 2.5s and softened from a blank line to a single line break:
+    // the caption is three lines tall, and a blank line spent a third of it on
+    // what was usually an ordinary breath. Only a long, deliberate pause earns a
+    // new line now. The pasted text is unaffected — the translate step
+    // paragraphs it by meaning.
+    static let pauseBreakSeconds = 4.0
     private var lastDeltaAt: Date? = nil
 
     init(key: String, preview: Bool = false) {
@@ -912,7 +917,7 @@ final class RealtimeSession {
             if isBreak {
                 // Blank line for a new thought; drop the delta's leading space so
                 // the new paragraph isn't indented.
-                deltaText += "\n\n" + String(d.drop(while: { $0 == " " }))
+                deltaText += "\n" + String(d.drop(while: { $0 == " " }))
             } else {
                 deltaText += d
             }
@@ -927,9 +932,9 @@ final class RealtimeSession {
                 let ms = Int(-recordingStartedAt.timeIntervalSinceNow * 1000)
                 log("caption: first text \(ms)ms after press (delay: \(delay)\(isPreview ? ", preview" : ""))")
             }
-            guard isPreview == captionFromPreview else { return }
-            if isBreak { log(String(format: "caption: pause %.2fs → break", gap)) }
-            LiveHUD.shared.update(live)
+            if isBreak { log(String(format: "caption: pause %.2fs → break%@", gap, isPreview ? " (preview)" : "")) }
+            _ = live
+            refreshCaption()
         case "error":
             // Server VAD usually commits every utterance on its own, so our
             // final explicit commit often finds an empty buffer. That's
@@ -1235,6 +1240,29 @@ var previewSession: RealtimeSession?
 /// Whether the caption follows the preview (normally) or the main session (if
 /// the preview could not be opened or dropped).
 var captionFromPreview = false
+
+/// The caption: the accurate session's words so far, then the fast preview's
+/// words beyond them.
+///
+/// The preview runs ahead of the main session by about a second, and gets more
+/// words wrong. So new words appear the moment the preview hears them, and are
+/// then overwritten by the main session's version as it catches up — the caption
+/// corrects itself in place, and by release it is the accurate text. Aligned by
+/// word count: the two streams transcribe the same audio, so the main session's
+/// Nth word is close enough to the preview's for this purpose, and a miss only
+/// shows for the moment until the main session overtakes it.
+func refreshCaption() {
+    let main = session?.textsNow().delta ?? ""
+    guard captionFromPreview, let pv = previewSession else {
+        LiveHUD.shared.update(main)
+        return
+    }
+    let fast = pv.textsNow().delta
+    if main.isEmpty { LiveHUD.shared.update(fast); return }
+    let covered = main.split(whereSeparator: { $0.isWhitespace }).count
+    let tail = fast.split(whereSeparator: { $0.isWhitespace }).dropFirst(covered)
+    LiveHUD.shared.update(tail.isEmpty ? main : main + " " + tail.joined(separator: " "))
+}
 
 func closePreview() {
     previewSession?.close()
