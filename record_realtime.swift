@@ -265,6 +265,18 @@ final class LiveHUD {
     private var badgeTimer: Timer?
     private let bottomInset: CGFloat = 90
     private var meter: LevelMeter?
+    private var closeButton: CloseButton?
+
+    // Opens as a small capsule holding only the level meter, and stretches into
+    // the full caption when the first words arrive. Until there are words there
+    // is nothing for the full width to hold, and a big empty bar over the screen
+    // promised more than was happening. The stretch keeps its anchor: centred
+    // horizontally, and pinned at the edge facing the field (or the screen
+    // bottom), so it grows away from what you are typing into.
+    private var compact = false
+    private let compactSize = NSSize(width: 220, height: 40)
+    private var expanding = false
+    private var queuedHeight: CGFloat?
 
     private func build() {
         // NSPanel, not NSWindow: .nonactivatingPanel only means anything on a panel,
@@ -365,6 +377,7 @@ final class LiveHUD {
         close.autoresizingMask = [.minXMargin, .minYMargin]
         close.onClick = { DispatchQueue.global().async { cancelDictation() } }
         bg.addSubview(close)
+        closeButton = close
         bg.clickable = col.frame
         w.contentView = bg
         window = w
@@ -425,10 +438,12 @@ final class LiveHUD {
     /// Height `text` needs at our fixed width, measured with the field's own cell
     /// (which accounts for its internal insets, unlike NSString.boundingRect).
     private func heightFor(_ text: String) -> CGFloat {
-        guard let lbl = label, let cell = lbl.cell as? NSTextFieldCell else { return 0 }
+        guard let cell = label?.cell as? NSTextFieldCell else { return 0 }
         let saved = cell.stringValue
         cell.stringValue = text
-        let bounds = NSRect(x: 0, y: 0, width: lbl.frame.width, height: 100_000)
+        // The full-size text width, not the label's current frame: mid-stretch,
+        // or while compact, that frame is narrower than the text will have.
+        let bounds = NSRect(x: 0, y: 0, width: width - rightW - padX * 2, height: 100_000)
         let needed = cell.cellSize(forBounds: bounds).height
         cell.stringValue = saved
         return ceil(needed)
@@ -448,17 +463,56 @@ final class LiveHUD {
     /// at each line wrap. This way AppKit redraws on its own next cycle.
     private func reposition(height: CGFloat) {
         guard let w = window else { return }
-        let frame = placement(height: height) ?? {
+        // A resize mid-stretch would cut the animation off; apply it after.
+        if expanding { queuedHeight = height; return }
+        w.setFrame(targetFrame(height: height), display: false)
+        updateChrome()
+    }
+
+    private func targetFrame(height: CGFloat) -> NSRect {
+        let pw = compact ? compactSize.width : width
+        let ph = compact ? compactSize.height : height
+        return placement(width: pw, height: ph) ?? {
             let mouse = NSEvent.mouseLocation
             let screen = NSScreen.screens.first { $0.frame.contains(mouse) }?.visibleFrame
                       ?? NSScreen.main?.visibleFrame
                       ?? NSRect(x: 0, y: 0, width: 1440, height: 900)
-            return NSRect(x: screen.midX - width / 2, y: screen.minY + bottomInset,
-                          width: width, height: height)
+            return NSRect(x: screen.midX - pw / 2, y: screen.minY + bottomInset,
+                          width: pw, height: ph)
         }()
-        w.setFrame(frame, display: false)
+    }
+
+    /// Which parts show in each shape, and the corner radius that goes with it.
+    private func updateChrome() {
+        let bg = bgView as? HUDContent
+        bg?.layer?.cornerRadius = compact ? compactSize.height / 2 : 14
+        label?.isHidden = compact
+        strip?.isHidden = compact
+        closeButton?.isHidden = compact
         // hitTest compares against this, so it has to track the resize.
-        if let strip = strip, let bg = bgView as? HUDContent { bg.clickable = strip.frame }
+        if let strip = strip { bg?.clickable = compact ? .zero : strip.frame }
+    }
+
+    /// Capsule → full caption, keeping the anchor. The text, language column and
+    /// close button appear once the shape has settled, not stretched along with it.
+    private func expand(height: CGFloat) {
+        guard compact, let w = window else { return }
+        compact = false
+        meter?.isHidden = true
+        label?.isHidden = true; strip?.isHidden = true; closeButton?.isHidden = true
+        (bgView as? HUDContent)?.layer?.cornerRadius = 14
+        expanding = true
+        let target = targetFrame(height: height)
+        NSAnimationContext.runAnimationGroup({ ctx in
+            ctx.duration = 0.24
+            ctx.timingFunction = CAMediaTimingFunction(name: .easeOut)
+            w.animator().setFrame(target, display: true)
+        }, completionHandler: {
+            self.expanding = false
+            self.updateChrome()
+            if let q = self.queuedHeight { self.queuedHeight = nil; self.reposition(height: q) }
+            self.placeMeter(listening: (self.label?.stringValue ?? "").isEmpty && self.errorText == nil)
+        })
     }
 
     /// Chosen side for this recording: nil until the field's position is known.
@@ -468,7 +522,7 @@ final class LiveHUD {
     /// A frame beside the field, or nil to fall back to the screen default.
     /// The field's position is published by the paste helper when it captures
     /// the field at hold start (accessibility coordinates, top-left origin).
-    private func placement(height: CGFloat) -> NSRect? {
+    private func placement(width: CGFloat, height: CGFloat) -> NSRect? {
         guard let raw = try? String(contentsOfFile: "/tmp/rewrite_field_frame", encoding: .utf8),
               let attrs = try? FileManager.default.attributesOfItem(atPath: "/tmp/rewrite_field_frame"),
               let mtime = attrs[.modificationDate] as? Date,
@@ -514,6 +568,9 @@ final class LiveHUD {
             self.badgeTimer = t
             self.pendingText = nil
             self.fieldSide = nil
+            self.compact = true
+            self.expanding = false
+            self.queuedHeight = nil
             self.currentHeight = self.minHeight
             self.reposition(height: self.minHeight)
             self.placeMeter(listening: true)
@@ -570,6 +627,11 @@ final class LiveHUD {
         label.stringValue = display
 
         let h = min(max(heightFor(display) + padY * 2, minHeight), maxHeight)
+        if compact && !t.isEmpty {
+            currentHeight = h
+            expand(height: h)
+            return
+        }
         if abs(h - currentHeight) > 0.5 {
             currentHeight = h
             reposition(height: h)
@@ -603,7 +665,7 @@ final class LiveHUD {
         label.stringValue = msg
         let h = min(max(heightFor(msg) + padY * 2, minHeight), maxHeight)
         currentHeight = h
-        reposition(height: h)
+        if compact { expand(height: h) } else { reposition(height: h) }
     }
 
     /// Microphone level, 0…1, from the audio tap.
@@ -615,13 +677,19 @@ final class LiveHUD {
     /// screen they are the proof of hearing. It fills the caption's text area,
     /// centred vertically in the panel.
     private func placeMeter(listening: Bool) {
-        guard let m = meter, let label = label else { return }
+        guard let m = meter, !expanding else { return }
         m.isHidden = !listening
         guard listening else { return }
-        let h: CGFloat = 28
-        let panelH = window?.frame.height ?? minHeight
-        m.frame = NSRect(x: label.frame.minX, y: (panelH - h) / 2,
-                         width: label.frame.width, height: h)
+        if compact {
+            let h: CGFloat = 16
+            m.frame = NSRect(x: 18, y: (compactSize.height - h) / 2,
+                             width: compactSize.width - 36, height: h)
+        } else {
+            let h: CGFloat = 28
+            let panelH = window?.frame.height ?? minHeight
+            m.frame = NSRect(x: padX, y: (panelH - h) / 2,
+                             width: width - rightW - padX * 2, height: h)
+        }
         m.needsDisplay = true
     }
 
