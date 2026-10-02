@@ -275,8 +275,13 @@ final class LiveHUD {
     // bottom), so it grows away from what you are typing into.
     private var compact = false
     private let compactSize = NSSize(width: 220, height: 40)
-    private var expanding = false
+    private var expanding = false             // any frame animation in flight
     private var queuedHeight: CGFloat?
+
+    // Ease-out with a barely visible overshoot: the second control point sits a
+    // little above 1, so the motion runs a few percent past its end and settles
+    // back — enough to feel physical, not enough to read as a bounce.
+    private static let settle = CAMediaTimingFunction(controlPoints: 0.3, 1.18, 0.55, 1.0)
 
     private func build() {
         // NSPanel, not NSWindow: .nonactivatingPanel only means anything on a panel,
@@ -493,10 +498,32 @@ final class LiveHUD {
         if let strip = strip { bg?.clickable = compact ? .zero : strip.frame }
     }
 
+    /// Appear by rising a few points into place while fading in, with the same
+    /// faint overshoot as the stretch. Shown WITHOUT taking focus.
+    private func riseIn() {
+        guard let w = window else { return }
+        let final = w.frame
+        if expanding { w.orderFrontRegardless(); return }   // an error is already stretching it
+        w.setFrame(final.offsetBy(dx: 0, dy: -14), display: false)
+        w.alphaValue = 0
+        w.orderFrontRegardless()
+        expanding = true
+        NSAnimationContext.runAnimationGroup({ ctx in
+            ctx.duration = 0.3
+            ctx.timingFunction = Self.settle
+            w.animator().setFrame(final, display: true)
+            w.animator().alphaValue = 1
+        }, completionHandler: {
+            self.expanding = false
+            if let q = self.queuedHeight { self.queuedHeight = nil; self.reposition(height: q) }
+        })
+    }
+
     /// Capsule → full caption, keeping the anchor. The text, language column and
     /// close button appear once the shape has settled, not stretched along with it.
     private func expand(height: CGFloat) {
         guard compact, let w = window else { return }
+        w.alphaValue = 1          // words can arrive while it is still rising in
         compact = false
         meter?.isHidden = true
         label?.isHidden = true; strip?.isHidden = true; closeButton?.isHidden = true
@@ -504,8 +531,8 @@ final class LiveHUD {
         expanding = true
         let target = targetFrame(height: height)
         NSAnimationContext.runAnimationGroup({ ctx in
-            ctx.duration = 0.24
-            ctx.timingFunction = CAMediaTimingFunction(name: .easeOut)
+            ctx.duration = 0.28
+            ctx.timingFunction = Self.settle
             w.animator().setFrame(target, display: true)
         }, completionHandler: {
             self.expanding = false
@@ -575,7 +602,7 @@ final class LiveHUD {
             self.reposition(height: self.minHeight)
             self.placeMeter(listening: true)
             self.applyError()                      // it may have arrived before the caption
-            self.window?.orderFrontRegardless()   // show WITHOUT taking focus
+            self.riseIn()
         }
     }
 
