@@ -148,6 +148,38 @@ final class LangStrip: NSView {
 /// The caption sits over whatever is being dictated into, so it must not absorb
 /// clicks — except on the strip, which is a control. Everything else reports no
 /// hit at all and the click reaches the app underneath.
+/// The caption's close button. "close-small-16" from the design-system icon
+/// library, geometry untouched; drawn as a template so it takes the caption's
+/// secondary text color.
+final class CloseButton: NSView {
+    var onClick: (() -> Void)?
+    private static let svg = """
+    <svg width="16" height="16" viewBox="0 0 16 16" fill="none" xmlns="http://www.w3.org/2000/svg">
+    <path d="M13 3L3 13M3 3L13 13" stroke="#333333" stroke-width="2" stroke-miterlimit="10" stroke-linecap="round" stroke-linejoin="round"/>
+    </svg>
+    """
+
+    override init(frame: NSRect) {
+        super.init(frame: frame)
+        let iv = NSImageView(frame: NSRect(x: (frame.width - 12) / 2, y: (frame.height - 12) / 2,
+                                           width: 12, height: 12))
+        if let img = NSImage(data: Data(Self.svg.utf8)) {
+            img.isTemplate = true
+            iv.image = img
+        }
+        iv.imageScaling = .scaleProportionallyUpOrDown
+        iv.contentTintColor = .secondaryLabelColor
+        addSubview(iv)
+        toolTip = "Cancel this dictation — nothing will be pasted"
+    }
+    required init?(coder: NSCoder) { fatalError() }
+
+    override func mouseDown(with event: NSEvent) {}          // claim the press
+    override func mouseUp(with event: NSEvent) {
+        if bounds.contains(convert(event.locationInWindow, from: nil)) { onClick?() }
+    }
+}
+
 final class HUDContent: NSVisualEffectView {
     var clickable: NSRect = .zero
     override func hitTest(_ point: NSPoint) -> NSView? {
@@ -328,6 +360,11 @@ final class LiveHUD {
         bg.addSubview(tf)
         bg.addSubview(m)
         bg.addSubview(col)
+        // Top-right corner, inside the clickable column.
+        let close = CloseButton(frame: NSRect(x: width - 26, y: minHeight - 26, width: 20, height: 20))
+        close.autoresizingMask = [.minXMargin, .minYMargin]
+        close.onClick = { DispatchQueue.global().async { cancelDictation() } }
+        bg.addSubview(close)
         bg.clickable = col.frame
         w.contentView = bg
         window = w
@@ -690,6 +727,16 @@ final class RealtimeSession {
     // transcriptions are still in flight and will arrive afterwards; without this
     // they would append themselves back into a transcript that was just emptied.
     private var discardThrough = 0
+    // CLEAR used to only empty the text. But nothing is committed until release
+    // — there is no server VAD on this model — so the whole hold was one
+    // utterance, and the speech before CLEAR came back inside the final
+    // transcript and was pasted anyway. CLEAR now commits the audio so far as an
+    // utterance of its own and discards that item by id: its deltas, and its
+    // completed transcript, whenever they arrive.
+    private var discardedItems = Set<String>()
+    private var discardNextCommit = false
+    private var currentItemId: String?
+    private var bytesSinceCommit = 0
     private var commitRejected = false
 
     // Pause tracking: a noticeable silence between utterances almost always
@@ -773,13 +820,17 @@ final class RealtimeSession {
         lock.lock()
         let ready = configured
         if !ready { pending.append(pcm) }
+        bytesSinceCommit += pcm.count
         lock.unlock()
         if ready {
             sendJSON(["type": "input_audio_buffer.append", "audio": pcm.base64EncodedString()])
         }
     }
 
-    func commit() { sendJSON(["type": "input_audio_buffer.commit"]) }
+    func commit() {
+        lock.lock(); bytesSinceCommit = 0; lock.unlock()
+        sendJSON(["type": "input_audio_buffer.commit"])
+    }
     func close()  { ws.cancel(with: .normalClosure, reason: nil) }
     func idleSeconds() -> TimeInterval { -lastActivity.timeIntervalSinceNow }
 
@@ -802,9 +853,17 @@ final class RealtimeSession {
         // Everything already committed is now unwanted, including the utterances
         // whose transcriptions have not come back yet.
         discardThrough = committedCount
+        if let id = currentItemId { discardedItems.insert(id) }
+        // Cut the audio here, so what was said before CLEAR is its own utterance
+        // and can be thrown away. Skipped when nothing has been sent since the last
+        // cut: committing an empty buffer is an API error.
+        let cut = bytesSinceCommit >= 4800
+        if cut { discardNextCommit = true }
         lock.unlock()
-        log("caption: cleared by the user — keeping the recording running")
-        LiveHUD.shared.update("")
+        if cut { commit() }
+        log("caption: cleared by the user — keeping the recording running"
+            + (isPreview ? " (preview)" : ""))
+        refreshCaption()
     }
 
     func finalText() -> String {
@@ -874,7 +933,14 @@ final class RealtimeSession {
         case "session.updated":
             flushPending()
         case "input_audio_buffer.committed":
-            lock.lock(); committedCount += 1; let n = committedCount; lock.unlock()
+            lock.lock()
+            committedCount += 1
+            let n = committedCount
+            if discardNextCommit, let id = obj["item_id"] as? String {
+                discardedItems.insert(id)
+                discardNextCommit = false
+            }
+            lock.unlock()
             log("utterance committed (#\(n)) — awaiting its transcription")
         case "conversation.item.input_audio_transcription.completed":
             // Authoritative text for this utterance — this is what gets pasted.
@@ -883,6 +949,7 @@ final class RealtimeSession {
             lock.lock()
             completedCount += 1
             let stale = completedCount <= discardThrough
+                || discardedItems.contains(obj["item_id"] as? String ?? "")
             if !seg.isEmpty && !stale {
                 transcript += transcript.isEmpty ? seg : " " + seg
             }
@@ -904,6 +971,9 @@ final class RealtimeSession {
             let d = obj["delta"] as? String ?? ""
             if d.isEmpty { return }
             lock.lock()
+            let item = obj["item_id"] as? String
+            if let item = item, discardedItems.contains(item) { lock.unlock(); return }
+            if let item = item { currentItemId = item }
             // Time to the first caption text. This is the number that matters when
             // weighing `delay`: "minimal" commits tokens on very little audio,
             // which is why the opening words can be decoded as the wrong language,
@@ -1262,6 +1332,29 @@ func refreshCaption() {
     let covered = main.split(whereSeparator: { $0.isWhitespace }).count
     let tail = fast.split(whereSeparator: { $0.isWhitespace }).dropFirst(covered)
     LiveHUD.shared.update(tail.isEmpty ? main : main + " " + tail.joined(separator: " "))
+}
+
+/// The caption's ×: abandon this dictation entirely.
+///
+/// Recording stops now, both sessions close, the caption goes away, and an
+/// empty transcript is handed to dictate.py — which pastes nothing. Releasing
+/// Globe afterwards finds no recording in progress and does nothing more.
+func cancelDictation() {
+    stateLock.lock()
+    guard isRecording else { stateLock.unlock(); return }
+    isRecording = false
+    stateLock.unlock()
+
+    engine.inputNode.removeTap(onBus: 0)
+    engine.stop()
+    session?.close(); session = nil
+    closePreview()
+    meterPeak = 0
+    LiveHUD.shared.hide()
+    try? FileManager.default.removeItem(atPath: provisionalPath)
+    try? "".write(toFile: transcriptPath, atomically: true, encoding: .utf8)
+    FileManager.default.createFile(atPath: readyFlag, contents: Data())
+    log("cancelled by the user — nothing will be pasted")
 }
 
 func closePreview() {
