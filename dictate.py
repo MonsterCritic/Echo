@@ -585,10 +585,16 @@ def return_to_captured_field(t0: float) -> bool:
         return False
 
     try:
-        rc = proc.wait(timeout=2.5)
+        rc = proc.wait(timeout=1.5)
     except subprocess.TimeoutExpired:
-        log("field helper did not answer — app-level paste")
         stop_focus_capture()
+        # The helper reports each step on stderr; the last one is where it hung.
+        try:
+            stages = [l for l in (proc.stderr.read() or "").splitlines() if l.startswith("stage:")]
+        except Exception:
+            stages = []
+        log(f"field helper did not answer (stuck at {stages[-1][6:] if stages else 'unknown'}) "
+            "— app-level paste")
         return False
     finally:
         _focus_capture = None
@@ -602,6 +608,7 @@ def return_to_captured_field(t0: float) -> bool:
         log("focus still in the field the hold started in")
         return True
     why = (proc.stderr.read() or "").strip() if proc.stderr else ""
+    why = " ".join(l for l in why.splitlines() if not l.startswith("stage:"))
     log(f"could not return to the field ({why or f'exit {rc}'}) — app-level paste")
     return False
 

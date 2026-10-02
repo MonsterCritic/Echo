@@ -138,6 +138,12 @@ func fieldAnchor(_ field: AXUIElement, caret: CFTypeRef?) -> CGRect? {
 
 enum Return { case unmoved, restored, failed(String) }
 
+/// Progress for the caller's log. If this process is killed for taking too long,
+/// the last stage written is where it was stuck.
+func stage(_ name: String) {
+    FileHandle.standardError.write("stage:\(name)\n".data(using: .utf8)!)
+}
+
 /// Put focus back in the field the hold started in, with the caret where it was.
 ///
 /// If focus never left the field, nothing is touched: the caret may have moved
@@ -146,6 +152,11 @@ enum Return { case unmoved, restored, failed(String) }
 func returnFocus(to field: AXUIElement, caret: CFTypeRef?) -> Return {
     var pid: pid_t = 0
     guard AXUIElementGetPid(field, &pid) == .success else { return .failed("FIELD_HAS_NO_APP") }
+    // Short deadlines from here on: the paste is waiting. An app that does not
+    // answer within half a second is treated as gone, not waited on for the
+    // system default of several seconds — which is what stalled 8% of pastes.
+    AXUIElementSetMessagingTimeout(field, 0.5)
+    stage("probe-field")
 
     // Web apps rebuild parts of the page as it re-renders, which can destroy the
     // very node that was captured. There is then nothing to return to.
@@ -156,17 +167,22 @@ func returnFocus(to field: AXUIElement, caret: CFTypeRef?) -> Return {
 
     let app = AXUIElementCreateApplication(pid)
     enableAX(app, pid)
+    AXUIElementSetMessagingTimeout(app, 0.5)
+    stage("check-focus")
     let frontmost = (axAttr(app, kAXFrontmostAttribute as String) as? Bool) ?? false
     if frontmost, let now = focusedElement(pid: pid), CFEqual(now, field) { return .unmoved }
 
     if !frontmost, let running = NSRunningApplication(processIdentifier: pid) {
+        stage("activate-app")
         running.activate(options: [.activateIgnoringOtherApps])
         usleep(200_000)
     }
+    stage("raise-window")
     // A field in another window of the same app needs that window brought forward
     // first: focusing an element inside a background window is quietly ignored.
     if let w = axAttr(field, kAXWindowAttribute as String) {
         let window = w as! AXUIElement
+        AXUIElementSetMessagingTimeout(window, 0.5)
         let current = axAttr(app, kAXFocusedWindowAttribute as String)
         if current == nil || !CFEqual(current!, window) {
             AXUIElementPerformAction(window, kAXRaiseAction as CFString)
@@ -174,6 +190,7 @@ func returnFocus(to field: AXUIElement, caret: CFTypeRef?) -> Return {
             usleep(120_000)
         }
     }
+    stage("focus-field")
     let setErr = AXUIElementSetAttributeValue(field, kAXFocusedAttribute as CFString, kCFBooleanTrue)
     guard setErr == .success else { return .failed("SET_FOCUS_REFUSED:\(setErr.rawValue)") }
     usleep(120_000)
