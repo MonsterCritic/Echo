@@ -182,10 +182,25 @@ final class CloseButton: NSView {
 
 final class HUDContent: NSVisualEffectView {
     var clickable: NSRect = .zero
+    var onScroll: ((NSEvent) -> Void)?
+    var onMiddleClick: (() -> Void)?
+
+    // Left clicks pass through everywhere except the control column, so the
+    // caption never blocks what is underneath it. The wheel and the middle
+    // button are taken over the whole panel: scroll switches the microphone,
+    // middle-click switches the language. Neither has a job here otherwise.
     override func hitTest(_ point: NSPoint) -> NSView? {
         let local = convert(point, from: nil)
+        if let t = NSApp.currentEvent?.type,
+           [.scrollWheel, .otherMouseDown, .otherMouseUp].contains(t) {
+            return bounds.contains(local) ? self : nil
+        }
         guard clickable.contains(local) else { return nil }
         return super.hitTest(point)
+    }
+    override func scrollWheel(with event: NSEvent) { onScroll?(event) }
+    override func otherMouseDown(with event: NSEvent) {
+        if event.buttonNumber == 2 { onMiddleClick?() }
     }
 }
 
@@ -274,7 +289,10 @@ final class LiveHUD {
     // horizontally, and pinned at the edge facing the field (or the screen
     // bottom), so it grows away from what you are typing into.
     private var compact = false
-    private let compactSize = NSSize(width: 220, height: 40)
+    private let compactSize = NSSize(width: 300, height: 40)
+    private let capsuleMicW: CGFloat = 110
+    private var capsuleMic: NSTextField?
+    private var scrollAccum: CGFloat = 0
     private var expanding = false             // any frame animation in flight
     private var queuedHeight: CGFloat?
 
@@ -383,6 +401,35 @@ final class LiveHUD {
         close.onClick = { DispatchQueue.global().async { cancelDictation() } }
         bg.addSubview(close)
         closeButton = close
+
+        // The capsule's right side: which microphone is being heard.
+        let cm = NSTextField(labelWithString: "")
+        cm.font = .systemFont(ofSize: 11, weight: .medium)
+        cm.textColor = .secondaryLabelColor
+        cm.alignment = .right
+        cm.lineBreakMode = .byTruncatingTail
+        cm.frame = NSRect(x: compactSize.width - 16 - capsuleMicW, y: (compactSize.height - 14) / 2,
+                          width: capsuleMicW, height: 14)
+        cm.isHidden = true
+        bg.addSubview(cm)
+        capsuleMic = cm
+
+        // One wheel notch is one microphone. Trackpads send a stream of small
+        // deltas, so those are added up and a switch happens per ~30pt of swipe.
+        bg.onScroll = { [weak self] e in
+            guard let self = self else { return }
+            let dy = e.scrollingDeltaY
+            var step = 0
+            if e.hasPreciseScrollingDeltas {
+                if e.phase == .began { self.scrollAccum = 0 }
+                self.scrollAccum += dy
+                if abs(self.scrollAccum) >= 30 { step = self.scrollAccum > 0 ? -1 : 1; self.scrollAccum = 0 }
+            } else if dy != 0 {
+                step = dy > 0 ? -1 : 1
+            }
+            if step != 0 { DispatchQueue.global().async { switchInput(step: step) } }
+        }
+        bg.onMiddleClick = { [weak self] in self?.toggleLanguage() }
         bg.clickable = col.frame
         w.contentView = bg
         window = w
@@ -438,6 +485,7 @@ final class LiveHUD {
         micLabel?.stringValue = mic.isEmpty
             ? "—"
             : mic.replacingOccurrences(of: " Microphone", with: "")
+        capsuleMic?.stringValue = micLabel?.stringValue ?? ""
     }
 
     /// Height `text` needs at our fixed width, measured with the field's own cell
@@ -494,6 +542,7 @@ final class LiveHUD {
         label?.isHidden = compact
         strip?.isHidden = compact
         closeButton?.isHidden = compact
+        capsuleMic?.isHidden = !compact
         // hitTest compares against this, so it has to track the resize.
         if let strip = strip { bg?.clickable = compact ? .zero : strip.frame }
     }
@@ -527,6 +576,7 @@ final class LiveHUD {
         compact = false
         meter?.isHidden = true
         label?.isHidden = true; strip?.isHidden = true; closeButton?.isHidden = true
+        capsuleMic?.isHidden = true
         (bgView as? HUDContent)?.layer?.cornerRadius = 14
         expanding = true
         let target = targetFrame(height: height)
@@ -710,7 +760,7 @@ final class LiveHUD {
         if compact {
             let h: CGFloat = 16
             m.frame = NSRect(x: 18, y: (compactSize.height - h) / 2,
-                             width: compactSize.width - 36, height: h)
+                             width: compactSize.width - 18 - 16 - capsuleMicW - 12, height: h)
         } else {
             let h: CGFloat = 28
             let panelH = window?.frame.height ?? minHeight
@@ -1274,6 +1324,127 @@ func inputDevice(matching target: String) -> AudioDeviceID? {
     return nil
 }
 
+/// Every device that can capture audio, by id and name. The engine's own
+/// internal aggregate is left out — it is not a microphone anyone can pick.
+func inputDeviceList() -> [(id: AudioDeviceID, name: String)] {
+    var addr = AudioObjectPropertyAddress(
+        mSelector: kAudioHardwarePropertyDevices,
+        mScope: kAudioObjectPropertyScopeGlobal,
+        mElement: kAudioObjectPropertyElementMain)
+    var size: UInt32 = 0
+    guard AudioObjectGetPropertyDataSize(AudioObjectID(kAudioObjectSystemObject),
+                                         &addr, 0, nil, &size) == noErr else { return [] }
+    var ids = [AudioDeviceID](repeating: 0, count: Int(size) / MemoryLayout<AudioDeviceID>.size)
+    guard AudioObjectGetPropertyData(AudioObjectID(kAudioObjectSystemObject),
+                                     &addr, 0, nil, &size, &ids) == noErr else { return [] }
+    return ids.compactMap { id in
+        guard hasInputChannels(id), let n = deviceName(id),
+              !n.hasPrefix("CADefaultDeviceAggregate") else { return nil }
+        return (id, n)
+    }
+}
+
+/// Point macOS at a different input — the same setting as System Settings →
+/// Sound → Input, and what the menubar picker does.
+func setDefaultInputDevice(_ id: AudioDeviceID) -> Bool {
+    var addr = AudioObjectPropertyAddress(
+        mSelector: kAudioHardwarePropertyDefaultInputDevice,
+        mScope: kAudioObjectPropertyScopeGlobal,
+        mElement: kAudioObjectPropertyElementMain)
+    var dev = id
+    return AudioObjectSetPropertyData(AudioObjectID(kAudioObjectSystemObject), &addr, 0, nil,
+                                      UInt32(MemoryLayout<AudioDeviceID>.size), &dev) == noErr
+}
+
+let switchLock = NSLock()
+var switchingInput = false
+
+// `kill -USR1 <pid>` / `kill -USR2 <pid>` switch to the next / previous mic, the
+// same as scrolling over the caption — so the switch can be exercised without a
+// mouse, from a script or a test.
+let switchSignals: [DispatchSourceSignal] = [(SIGUSR1, 1), (SIGUSR2, -1)].map { sig, step in
+    signal(sig, SIG_IGN)
+    let src = DispatchSource.makeSignalSource(signal: sig, queue: .global())
+    src.setEventHandler { switchInput(step: step) }
+    src.resume()
+    return src
+}
+
+/// Move the recording in progress to the next (step +1) or previous (-1) mic.
+///
+/// Scrolled from the caption. The recognisers never see a seam: the WebSocket
+/// sessions stay open and the same audio handler is moved onto a fresh engine
+/// built on the new device, so the stream just continues from another mic.
+/// The choice is also remembered as the preferred input, so the menubar's guard
+/// keeps it instead of pulling the old one back a second later. If the new mic
+/// will not start, everything goes back to the old one and the recording goes
+/// on — a failed switch must never cost the dictation.
+func switchInput(step: Int) {
+    switchLock.lock()
+    if switchingInput { switchLock.unlock(); log("input switch: ignored, one already in progress"); return }
+    switchingInput = true
+    switchLock.unlock()
+    defer { switchLock.lock(); switchingInput = false; switchLock.unlock() }
+
+    stateLock.lock(); let live = isRecording; stateLock.unlock()
+    guard live, let tap = micTapBlock else { log("input switch: no recording in progress"); return }
+    let devices = inputDeviceList()
+    guard devices.count > 1 else { log("input switch: only one microphone available"); return }
+    guard let cur = defaultInputDeviceID(),
+          let i = devices.firstIndex(where: { $0.id == cur }) else {
+        log("input switch: the current input is not in the device list"); return
+    }
+    let next = devices[(i + step + devices.count) % devices.count]
+    log("input switch: \(devices[i].name) → \(next.name)  (order: \(devices.map(\.name).joined(separator: ", ")))")
+
+    func startFresh() -> Bool {
+        let fresh = AVAudioEngine()
+        let fmt = fresh.inputNode.outputFormat(forBus: 0)
+        guard fmt.sampleRate > 0, fmt.channelCount > 0 else { return false }
+        fresh.inputNode.installTap(onBus: 0, bufferSize: 2048, format: nil, block: tap)
+        fresh.prepare()
+        do { try fresh.start() } catch {
+            log("input switch: \(next.name) would not start — \(error)")
+            fresh.inputNode.removeTap(onBus: 0)
+            return false
+        }
+        engine = fresh
+        return true
+    }
+
+    let began = Date()
+    engine.inputNode.removeTap(onBus: 0)
+    engine.stop()
+    guard setDefaultInputDevice(next.id) else {
+        log("input switch: macOS refused \(next.name)")
+        _ = startFresh()
+        return
+    }
+    usleep(150_000)               // let the default change land before opening it
+    log("input switch: default set after \(Int(-began.timeIntervalSinceNow * 1000))ms, opening")
+    // A device switch to a different sample rate (EarPods 44.1kHz → Studio
+    // Display 48kHz) can still present the old format to an engine created right
+    // after the change, and the engine refuses to start (-10868). Give the new
+    // device a moment and try again before giving up.
+    var opened = startFresh()
+    for wait in [300_000, 600_000] where !opened {
+        usleep(useconds_t(wait))
+        opened = startFresh()
+        if opened { log("input switch: opened on retry after \(wait / 1000)ms") }
+    }
+    if opened {
+        try? next.name.write(toFile: actualInputFile, atomically: true, encoding: .utf8)
+        try? next.name.write(toFile: NSString(string: "~/Library/Application Support/Echo/preferred_input")
+                                       .expandingTildeInPath, atomically: true, encoding: .utf8)
+        log("input switch: now on \(next.name) (\(Int(-began.timeIntervalSinceNow * 1000))ms)")
+    } else {
+        _ = setDefaultInputDevice(cur)
+        usleep(150_000)
+        log(startFresh() ? "input switch failed — back on \(deviceName(cur) ?? "the previous mic")"
+                         : "input switch failed and the previous mic would not reopen")
+    }
+}
+
 /// Names of every device that can capture audio.
 func availableInputNames() -> [String] {
     var addr = AudioObjectPropertyAddress(
@@ -1397,7 +1568,14 @@ func pinInputDevice() {
 }
 
 // ── Live PCM capture (AVAudioEngine → 24kHz Int16) ───────────────────────────
-let engine = AVAudioEngine()
+// A var since the caption's scroll-to-switch: a live microphone change builds a
+// fresh engine on the new device rather than restarting this one (see
+// switchInput). Restarting the same engine on a new device failed with -10868
+// every time — the engine stays bound to the device it was created on.
+var engine = AVAudioEngine()
+/// The current recording's audio handler, kept so a fresh engine can be given
+/// the very same one: same converter, same sessions, nothing for them to notice.
+var micTapBlock: AVAudioNodeTapBlock?
 var converter: AVAudioConverter?
 var session: RealtimeSession?
 /// The fast session behind the live caption. See RealtimeSession.isPreview.
@@ -1563,8 +1741,7 @@ func startRecording() {
     var loggedFirst = false
     var hudShown = false
     // Named so a device switch can put it back after tearing the graph down.
-    let installMicTap: () -> Void = {
-    input.installTap(onBus: 0, bufferSize: 2048, format: nil) { buffer, _ in
+    let tapBlock: AVAudioNodeTapBlock = { buffer, _ in
         // Build the converter from the buffer we are actually handed, so a device
         // change can't leave one behind that still expects the previous rate.
         if let c = converter, c.inputFormat.isEqual(buffer.format) {
@@ -1616,8 +1793,8 @@ func startRecording() {
         previewSession?.sendAudio(pcm)
         stateLock.lock(); sentBytes += pcm.count; stateLock.unlock()
     }
-    }
-    installMicTap()
+    micTapBlock = tapBlock
+    input.installTap(onBus: 0, bufferSize: 2048, format: nil, block: tapBlock)
     engine.prepare()
     do {
         try engine.start()
@@ -1669,6 +1846,12 @@ func stopRecording() {
     let bytes = sentBytes
     stateLock.unlock()
 
+    // A mic switch mid-flight is swapping engines; let it land first.
+    for _ in 0..<100 {
+        switchLock.lock(); let busy = switchingInput; switchLock.unlock()
+        if !busy { break }
+        usleep(20_000)
+    }
     engine.inputNode.removeTap(onBus: 0)
     engine.stop()
     log("stopped — streamed \(bytes) bytes of PCM"
