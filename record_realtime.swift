@@ -295,6 +295,21 @@ final class LiveHUD {
     private var scrollAccum: CGFloat = 0
     private var expanding = false             // any frame animation in flight
     private var queuedHeight: CGFloat?
+    private var glideQueued = false
+    // Bumped by every show / collapse / hide, so a delayed appearance that has
+    // been overtaken by one of them does nothing when it fires.
+    private var showGen = 0
+
+    // On release the caption folds into a small circle with a spinner, which
+    // stays until the text is in. If there is no field to put it in, the paste
+    // helper opens its "click a text field" window out of this same circle.
+    private var dot = false
+    private let dotSize: CGFloat = 36
+    private var spinner: NSProgressIndicator?
+    private var dotTimer: Timer?
+    private var dotSince = Date()
+    static let dotFramePath = "/tmp/rewrite_hud_dot"
+    static let insertedPath = "/tmp/rewrite_insert_done"
 
     // Ease-out with a barely visible overshoot: the second control point sits a
     // little above 1, so the motion runs a few percent past its end and settles
@@ -430,6 +445,15 @@ final class LiveHUD {
             if step != 0 { DispatchQueue.global().async { switchInput(step: step) } }
         }
         bg.onMiddleClick = { [weak self] in self?.toggleLanguage() }
+
+        let sp = NSProgressIndicator(frame: NSRect(x: (dotSize - 16) / 2, y: (dotSize - 16) / 2,
+                                                   width: 16, height: 16))
+        sp.style = .spinning
+        sp.controlSize = .small
+        sp.isDisplayedWhenStopped = false
+        sp.isHidden = true
+        bg.addSubview(sp)
+        spinner = sp
         bg.clickable = col.frame
         w.contentView = bg
         window = w
@@ -515,7 +539,7 @@ final class LiveHUD {
     /// relayout on the main thread, which is what previously stalled the caption
     /// at each line wrap. This way AppKit redraws on its own next cycle.
     private func reposition(height: CGFloat) {
-        guard let w = window else { return }
+        guard let w = window, !dot else { return }
         // A resize mid-stretch would cut the animation off; apply it after.
         if expanding { queuedHeight = height; return }
         w.setFrame(targetFrame(height: height), display: false)
@@ -523,8 +547,8 @@ final class LiveHUD {
     }
 
     private func targetFrame(height: CGFloat) -> NSRect {
-        let pw = compact ? compactSize.width : width
-        let ph = compact ? compactSize.height : height
+        let pw = dot ? dotSize : compact ? compactSize.width : width
+        let ph = dot ? dotSize : compact ? compactSize.height : height
         return placement(width: pw, height: ph) ?? {
             let mouse = NSEvent.mouseLocation
             let screen = NSScreen.screens.first { $0.frame.contains(mouse) }?.visibleFrame
@@ -538,13 +562,15 @@ final class LiveHUD {
     /// Which parts show in each shape, and the corner radius that goes with it.
     private func updateChrome() {
         let bg = bgView as? HUDContent
-        bg?.layer?.cornerRadius = compact ? compactSize.height / 2 : 14
-        label?.isHidden = compact
-        strip?.isHidden = compact
-        closeButton?.isHidden = compact
-        capsuleMic?.isHidden = !compact
+        bg?.layer?.cornerRadius = dot ? dotSize / 2 : compact ? compactSize.height / 2 : 14
+        label?.isHidden = compact || dot
+        strip?.isHidden = compact || dot
+        closeButton?.isHidden = compact || dot
+        capsuleMic?.isHidden = !compact || dot
+        if dot { meter?.isHidden = true }
+        spinner?.isHidden = !dot
         // hitTest compares against this, so it has to track the resize.
-        if let strip = strip { bg?.clickable = compact ? .zero : strip.frame }
+        if let strip = strip { bg?.clickable = compact || dot ? .zero : strip.frame }
     }
 
     /// Appear by rising a few points into place while fading in, with the same
@@ -562,16 +588,102 @@ final class LiveHUD {
             ctx.timingFunction = Self.settle
             w.animator().setFrame(final, display: true)
             w.animator().alphaValue = 1
+        }, completionHandler: { self.animationEnded() })
+    }
+
+    /// Whatever was held back while a frame animation ran: a move to the field
+    /// that turned up meanwhile, or a height the text grew to.
+    private func animationEnded() {
+        expanding = false
+        if glideQueued { glideQueued = false; glide(); return }
+        if let q = queuedHeight { queuedHeight = nil; reposition(height: q) }
+    }
+
+    /// Move to where the caption belongs now — beside a field whose position
+    /// arrived after it was already showing — by sliding, not jumping.
+    private func glide() {
+        guard let w = window, w.isVisible else { return }
+        if expanding { glideQueued = true; return }
+        let target = targetFrame(height: currentHeight)
+        if target == w.frame { return }
+        expanding = true
+        NSAnimationContext.runAnimationGroup({ ctx in
+            ctx.duration = 0.3
+            ctx.timingFunction = Self.settle
+            w.animator().setFrame(target, display: true)
         }, completionHandler: {
-            self.expanding = false
-            if let q = self.queuedHeight { self.queuedHeight = nil; self.reposition(height: q) }
+            self.updateChrome()
+            self.animationEnded()
+            self.placeMeter(listening: (self.label?.stringValue ?? "").isEmpty && self.errorText == nil)
+        })
+    }
+
+    /// Release: fold into the loading circle, at the same anchor. Called on key
+    /// up; the circle stays until dictate.py reports the text delivered (or the
+    /// paste helper takes over with its own window).
+    func collapse() {
+        DispatchQueue.main.async {
+            self.showGen += 1
+            guard let w = self.window, w.isVisible, !self.dot else { return }
+            self.dot = true
+            self.compact = false
+            self.queuedHeight = nil
+            self.glideQueued = false
+            self.dotSince = Date()
+            w.alphaValue = 1
+            self.updateChrome()
+            self.spinner?.isHidden = true          // until the shape has settled
+            self.badgeTimer?.invalidate(); self.badgeTimer = nil
+            let target = self.targetFrame(height: self.dotSize)
+            // Where the circle sits, for the paste helper to grow its window from.
+            try? "\(target.minX) \(target.minY) \(target.width) \(target.height)"
+                .write(toFile: Self.dotFramePath, atomically: true, encoding: .utf8)
+            self.expanding = true
+            NSAnimationContext.runAnimationGroup({ ctx in
+                ctx.duration = 0.3
+                ctx.timingFunction = Self.settle
+                w.animator().setFrame(target, display: true)
+            }, completionHandler: {
+                self.expanding = false
+                guard self.dot else { return }
+                self.spinner?.isHidden = false
+                self.spinner?.startAnimation(nil)
+            })
+            self.dotTimer?.invalidate()
+            let t = Timer.scheduledTimer(withTimeInterval: 0.08, repeats: true) { [weak self] _ in
+                guard let self = self else { return }
+                let done = (try? FileManager.default.attributesOfItem(atPath: Self.insertedPath))?[.modificationDate]
+                    .flatMap { $0 as? Date }.map { $0 >= self.dotSince.addingTimeInterval(-0.5) } ?? false
+                // A cap, so a dictate.py that never reports back cannot leave the
+                // circle spinning on screen.
+                if done || -self.dotSince.timeIntervalSinceNow > 30 { self.dismissDot() }
+            }
+            RunLoop.main.add(t, forMode: .common)
+            self.dotTimer = t
+        }
+    }
+
+    /// The text is in (or handed on): the circle fades out where it is.
+    private func dismissDot() {
+        dotTimer?.invalidate(); dotTimer = nil
+        guard dot, let w = window else { return }
+        let gen = showGen
+        NSAnimationContext.runAnimationGroup({ ctx in
+            ctx.duration = 0.18
+            w.animator().alphaValue = 0
+        }, completionHandler: {
+            guard gen == self.showGen else { return }   // a new dictation took the window
+            self.spinner?.stopAnimation(nil)
+            self.dot = false
+            w.orderOut(nil)
+            w.alphaValue = 1
         })
     }
 
     /// Capsule → full caption, keeping the anchor. The text, language column and
     /// close button appear once the shape has settled, not stretched along with it.
     private func expand(height: CGFloat) {
-        guard compact, let w = window else { return }
+        guard compact, !dot, let w = window else { return }
         w.alphaValue = 1          // words can arrive while it is still rising in
         compact = false
         meter?.isHidden = true
@@ -585,9 +697,8 @@ final class LiveHUD {
             ctx.timingFunction = Self.settle
             w.animator().setFrame(target, display: true)
         }, completionHandler: {
-            self.expanding = false
             self.updateChrome()
-            if let q = self.queuedHeight { self.queuedHeight = nil; self.reposition(height: q) }
+            self.animationEnded()
             self.placeMeter(listening: (self.label?.stringValue ?? "").isEmpty && self.errorText == nil)
         })
     }
@@ -637,23 +748,44 @@ final class LiveHUD {
             let t = Timer.scheduledTimer(withTimeInterval: 0.25, repeats: true) { [weak self] _ in
                 guard let self = self else { return }
                 self.refreshBadge()
-                // The field's position can land after the caption appears; move
+                // The field's position can land after the caption appears; slide
                 // beside it as soon as it does.
-                if self.fieldSide == nil { self.reposition(height: self.currentHeight) }
+                if self.fieldSide == nil, !self.dot, self.window?.isVisible == true,
+                   self.placement(width: 1, height: 1) != nil { self.glide() }
             }
             RunLoop.main.add(t, forMode: .common)
             self.badgeTimer = t
             self.pendingText = nil
             self.fieldSide = nil
             self.compact = true
+            self.dot = false
+            self.dotTimer?.invalidate(); self.dotTimer = nil
+            self.spinner?.stopAnimation(nil)
+            self.window?.orderOut(nil)
+            self.window?.alphaValue = 1
             self.expanding = false
             self.queuedHeight = nil
+            self.glideQueued = false
             self.currentHeight = self.minHeight
-            self.reposition(height: self.minHeight)
-            self.placeMeter(listening: true)
-            self.applyError()                      // it may have arrived before the caption
-            self.riseIn()
+            self.updateChrome()
+            self.showGen += 1
+            self.appear(gen: self.showGen, until: Date().addingTimeInterval(0.35))
         }
+    }
+
+    /// Rise in beside the field — waiting a moment for its position if it has
+    /// not been published yet. Appearing at the screen default and then moving
+    /// was the flicker: capsule at the bottom, stretch, then a jump to the field.
+    private func appear(gen: Int, until: Date) {
+        guard gen == showGen else { return }
+        if placement(width: 1, height: 1) == nil && Date() < until {
+            DispatchQueue.main.asyncAfter(deadline: .now() + 0.04) { self.appear(gen: gen, until: until) }
+            return
+        }
+        reposition(height: minHeight)
+        placeMeter(listening: true)
+        applyError()                      // it may have arrived before the caption
+        riseIn()
     }
 
     /// Latest text awaiting display, and whether a flush is already queued.
@@ -682,7 +814,7 @@ final class LiveHUD {
         flushQueued = false
         guard let raw = pendingText, let label = label else { return }
         pendingText = nil
-        if errorText != nil { return }
+        if errorText != nil || dot { return }
 
         let t = raw.trimmingCharacters(in: .whitespacesAndNewlines)
         var display = t
@@ -736,7 +868,7 @@ final class LiveHUD {
     }
 
     private func applyError() {
-        guard let msg = errorText, let label = label else { return }
+        guard let msg = errorText, let label = label, !dot else { return }
         meter?.isHidden = true
         label.textColor = .systemRed
         label.stringValue = msg
@@ -755,6 +887,7 @@ final class LiveHUD {
     /// centred vertically in the panel.
     private func placeMeter(listening: Bool) {
         guard let m = meter, !expanding else { return }
+        if dot { m.isHidden = true; return }
         m.isHidden = !listening
         guard listening else { return }
         if compact {
@@ -772,6 +905,10 @@ final class LiveHUD {
 
     func hide() {
         DispatchQueue.main.async {
+            self.showGen += 1
+            self.dot = false
+            self.dotTimer?.invalidate(); self.dotTimer = nil
+            self.spinner?.stopAnimation(nil)
             self.meter?.reset()
             self.badgeTimer?.invalidate()
             self.badgeTimer = nil
@@ -1882,6 +2019,7 @@ func stopRecording() {
         return
     }
     deadCaptures = 0
+    LiveHUD.shared.collapse()
     s.commit()
     // The preview commits too, so its last words reach the caption while the main
     // session finishes; it is closed with the handoff.
@@ -1950,9 +2088,8 @@ func stopRecording() {
         let same = atRelease.filter { !$0.isWhitespace } == text.filter { !$0.isWhitespace }
         log("handoff: \(text.count) chars (\(d)/\(c) segments) after \(waited)ms via \(stopReason)"
             + "  [caption at release \(atRelease.count) chars, \(same ? "complete" : "SHORT")]")
-        // Keep the HUD up until the text is handed off, then let dictate.py's
-        // translate + paste take over.
-        LiveHUD.shared.hide()
+        // The caption folded into the loading circle on release; it goes away
+        // when dictate.py reports the text delivered.
         s.close()
         pv?.close()
     }

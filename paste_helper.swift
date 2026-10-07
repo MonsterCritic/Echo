@@ -629,13 +629,17 @@ enum AwaitField {
         }
         let hintW: CGFloat = 110, padX: CGFloat = 18
         let textW = size.width - padX * 2 - hintW
-        bg.addSubview(label("Click a text field to insert",
+        // The text sits in its own layer so it can fade in once the window has
+        // finished growing out of the caption's loading circle.
+        let content = NSView(frame: NSRect(origin: .zero, size: size))
+        bg.addSubview(content)
+        content.addSubview(label("Click a text field to insert",
                             .systemFont(ofSize: 15, weight: .medium), .labelColor,
                             NSRect(x: padX, y: 32, width: textW, height: 20)))
         let quoted = preview.isEmpty ? "" : "\u{201C}\(preview)\u{201D}"
-        bg.addSubview(label(quoted, .systemFont(ofSize: 13), .secondaryLabelColor,
+        content.addSubview(label(quoted, .systemFont(ofSize: 13), .secondaryLabelColor,
                             NSRect(x: padX, y: 12, width: textW, height: 17)))
-        bg.addSubview(label("Esc to cancel", .systemFont(ofSize: 12), .tertiaryLabelColor,
+        content.addSubview(label("Esc to cancel", .systemFont(ofSize: 12), .tertiaryLabelColor,
                             NSRect(x: size.width - padX - hintW, y: 23, width: hintW, height: 16),
                             .right))
 
@@ -647,17 +651,68 @@ enum AwaitField {
         bar = b
 
         p.contentView = bg
+        panel = p
+
+        // Grow out of the caption's loading circle when there is one: the
+        // dictation visibly turns into this window instead of a new one popping
+        // up somewhere else.
+        if let dot = dotFrame() {
+            let screen = NSScreen.screens.first { $0.frame.intersects(dot) }?.visibleFrame
+                      ?? NSScreen.main?.visibleFrame ?? NSRect(x: 0, y: 0, width: 1440, height: 900)
+            var x = dot.midX - size.width / 2
+            x = min(max(x, screen.minX + 8), screen.maxX - size.width - 8)
+            var y = dot.midY - size.height / 2
+            y = min(max(y, screen.minY + 8), screen.maxY - size.height - 8)
+            let final = NSRect(x: x, y: y, width: size.width, height: size.height)
+            content.alphaValue = 0
+            b.isHidden = true
+            bg.layer?.cornerRadius = dot.height / 2
+            p.setFrame(dot, display: false)
+            p.orderFrontRegardless()
+            markHandedOver()
+            NSAnimationContext.runAnimationGroup({ ctx in
+                ctx.duration = 0.32
+                ctx.timingFunction = CAMediaTimingFunction(controlPoints: 0.3, 1.18, 0.55, 1.0)
+                p.animator().setFrame(final, display: true)
+            }, completionHandler: {
+                bg.layer?.cornerRadius = 14
+                b.isHidden = false
+                NSAnimationContext.runAnimationGroup { ctx in
+                    ctx.duration = 0.15
+                    content.animator().alphaValue = 1
+                }
+            })
+            return
+        }
+
         let mouse = NSEvent.mouseLocation
         let screen = NSScreen.screens.first { $0.frame.contains(mouse) }?.visibleFrame
                   ?? NSScreen.main?.visibleFrame ?? NSRect(x: 0, y: 0, width: 1440, height: 900)
         p.setFrameOrigin(NSPoint(x: screen.midX - size.width / 2, y: screen.minY + 90))
         p.alphaValue = 0
         p.orderFrontRegardless()
+        markHandedOver()
         NSAnimationContext.runAnimationGroup { ctx in
             ctx.duration = 0.15
             p.animator().alphaValue = 1
         }
-        panel = p
+    }
+
+    /// The recorder's loading circle, in Cocoa screen coordinates, if this
+    /// dictation left one (written on release, removed when the next hold starts).
+    static func dotFrame() -> NSRect? {
+        let path = "/tmp/rewrite_hud_dot"
+        guard let raw = try? String(contentsOfFile: path, encoding: .utf8),
+              let m = (try? FileManager.default.attributesOfItem(atPath: path))?[.modificationDate] as? Date,
+              -m.timeIntervalSinceNow < 120 else { return nil }
+        let n = raw.split(separator: " ").compactMap { Double($0.trimmingCharacters(in: .whitespacesAndNewlines)) }
+        guard n.count == 4, n[2] > 0, n[3] > 0 else { return nil }
+        return NSRect(x: n[0], y: n[1], width: n[2], height: n[3])
+    }
+
+    /// Tells the recorder this window has taken over, so its circle fades out.
+    static func markHandedOver() {
+        FileManager.default.createFile(atPath: "/tmp/rewrite_insert_done", contents: Data())
     }
 }
 

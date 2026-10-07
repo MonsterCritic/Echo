@@ -35,6 +35,10 @@ PASTE_HELPER = os.path.join(SCRIPT_DIR, "paste_helper")
 HANDOFF_PATH = "/tmp/rewrite_paste_handoff.txt"
 # pid of the helper holding a dictation until a text field is clicked
 AWAIT_PID    = "/tmp/rewrite_await_field.pid"
+# The caption folds into a loading circle on release and stays until this file
+# is touched — when the text is in, or the dictation has ended any other way.
+HUD_DOT_PATH = "/tmp/rewrite_hud_dot"
+INSERTED_PATH = "/tmp/rewrite_insert_done"
 
 # ── Which recorder are we paired with? ────────────────────────────────────────
 # True  → record_realtime.app streamed the audio to OpenAI's realtime API during
@@ -244,6 +248,17 @@ def load_env(name: str) -> str | None:
 
 # ── Daemon coordination ───────────────────────────────────────────────────────
 
+LAUNCH_PID = "/tmp/rewrite_dictate_launch.pid"
+
+
+def _still_newest() -> bool:
+    try:
+        with open(LAUNCH_PID) as f:
+            return f.read().strip() in ("", str(os.getpid()))
+    except OSError:
+        return True
+
+
 def wait_for_release(timeout_s: float = 120.0, while_finishing=None) -> bool:
     """Block until the user releases the key and the recorder has flushed.
 
@@ -255,6 +270,13 @@ def wait_for_release(timeout_s: float = 120.0, while_finishing=None) -> bool:
     dictation happened)."""
     deadline = time.time() + timeout_s
     while time.time() < deadline:
+        # A newer hold launched its own copy of this script, so this one's hold
+        # never produced a recording (the recorder was not ready, or the key was
+        # only tapped). Waiting on regardless meant every such leftover picked up
+        # the NEXT dictation too, and pasted it once each.
+        if not _still_newest():
+            log("superseded by a newer hold while waiting — exiting")
+            return False
         released = not os.path.exists(START_FLAG)
         if released and os.path.exists(READY_FLAG):
             return True
@@ -643,6 +665,16 @@ def cancel_pending_insert():
         pass
     try:
         os.remove(AWAIT_PID)
+    except OSError:
+        pass
+
+
+def mark_inserted():
+    """Let the recorder's loading circle go."""
+    try:
+        with open(INSERTED_PATH, "w"):
+            pass
+        os.utime(INSERTED_PATH, None)    # an existing file must still look new
     except OSError:
         pass
 
@@ -1268,9 +1300,16 @@ def main():
     readable; a launchd agent would be TCC-blocked from reading .env / the log.
     """
     log("LAUNCH (hold start) — warming up")
+    try:
+        with open(LAUNCH_PID, "w") as f:
+            f.write(str(os.getpid()))
+    except OSError:
+        pass
     # The caption places itself beside the field this hold starts in; a frame
     # left by an earlier hold would put it beside the wrong one.
     try: os.remove("/tmp/rewrite_field_frame")
+    except OSError: pass
+    try: os.remove(HUD_DOT_PATH)
     except OSError: pass
     prewarm_paste_helper()      # primary paste path
     prewarm_system_events()     # osascript fallback path
@@ -1300,7 +1339,7 @@ def main():
             log(f"released — translating the text at release early ({len(text)} chars)")
 
     if not wait_for_release(timeout_s=120.0, while_finishing=start_early):
-        log("no recording within 120s — exiting")
+        log("no recording for this hold — exiting")
         stop_focus_capture()
         return
 
@@ -1319,7 +1358,10 @@ def main():
     try: os.remove(READY_FLAG)
     except Exception: pass
 
-    process_dictation(t0, early[0] if early else None)
+    try:
+        process_dictation(t0, early[0] if early else None)
+    finally:
+        mark_inserted()
 
 
 if __name__ == "__main__":
