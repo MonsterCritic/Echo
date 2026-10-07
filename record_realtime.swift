@@ -569,6 +569,19 @@ final class LiveHUD {
         capsuleMic?.isHidden = !compact || dot
         if dot { meter?.isHidden = true }
         spinner?.isHidden = !dot
+        // Autoresizing is off while folded: shrinking to a 36pt circle would
+        // squeeze the caption below zero width, AppKit clamps it, and on the
+        // way back it came out wider than its slot — running under the
+        // language column. The full layout is set explicitly instead.
+        bg?.autoresizesSubviews = !dot
+        if !compact && !dot, let bg = bg {
+            let b = bg.bounds
+            label?.frame = NSRect(x: padX, y: padY, width: width - rightW - padX * 2,
+                                  height: max(0, b.height - padY * 2))
+            strip?.frame = NSRect(x: width - rightW, y: 0, width: rightW, height: b.height)
+            strip?.needsLayout = true
+            closeButton?.frame = NSRect(x: width - 26, y: b.height - 26, width: 20, height: 20)
+        }
         // hitTest compares against this, so it has to track the resize.
         if let strip = strip { bg?.clickable = compact || dot ? .zero : strip.frame }
     }
@@ -768,6 +781,14 @@ final class LiveHUD {
             self.glideQueued = false
             self.currentHeight = self.minHeight
             self.updateChrome()
+            if let w = self.window {
+                // Back to the full layout at full size before shrinking to the
+                // capsule, so autoresizing starts from frames that are right.
+                (self.bgView as? HUDContent)?.autoresizesSubviews = false
+                w.setFrame(NSRect(origin: w.frame.origin, size: NSSize(width: self.width, height: self.minHeight)), display: false)
+                let c = self.compact; self.compact = false; self.updateChrome(); self.compact = c
+                self.updateChrome()
+            }
             self.showGen += 1
             self.appear(gen: self.showGen, until: Date().addingTimeInterval(0.35))
         }
