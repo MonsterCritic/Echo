@@ -180,6 +180,51 @@ EOF
 launchctl unload "$PLIST_PATH" 2>/dev/null || true
 launchctl load "$PLIST_PATH"
 
+# ── 8b. Globe key listener (replaces the Karabiner rule) ─────────────────────
+# Karabiner-Elements needs its virtual keyboard driver for ANY rule to run, and
+# after a macOS update that driver can stop loading — taking dictation with it.
+# Echo watches the Globe key itself with an event tap instead. Needs
+# Accessibility for "globe_listener" (it prompts on first launch).
+echo "Installing the Globe key listener…"
+printf '%s\n' "$SCRIPT_DIR" > "$HOME/Library/Application Support/Echo/repo_dir"
+build_app globe_listener '<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>CFBundleIdentifier</key><string>com.echo.context-helper.globe-listener</string>
+    <key>CFBundleExecutable</key><string>globe_listener</string>
+    <key>CFBundleName</key><string>Echo Globe</string>
+    <key>CFBundlePackageType</key><string>APPL</string>
+    <key>CFBundleShortVersionString</key><string>1.0</string>
+    <key>CFBundleVersion</key><string>1</string>
+    <key>LSUIElement</key><true/>
+    <key>NSAppSleepDisabled</key><true/>
+</dict>
+</plist>'
+GLOBE_PLIST="$HOME/Library/LaunchAgents/com.echo.context-helper.globe-listener.plist"
+cat > "$GLOBE_PLIST" <<EOF
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key><string>com.echo.context-helper.globe-listener</string>
+    <key>ProgramArguments</key>
+    <array>
+        <string>$BIN_DIR/globe_listener.app/Contents/MacOS/globe_listener</string>
+    </array>
+    <key>RunAtLoad</key><true/>
+    <key>KeepAlive</key><true/>
+    <key>ProcessType</key><string>Interactive</string>
+    <key>StandardOutPath</key><string>/tmp/globe_listener.out.log</string>
+    <key>StandardErrorPath</key><string>/tmp/globe_listener.err.log</string>
+</dict>
+</plist>
+EOF
+launchctl unload "$GLOBE_PLIST" 2>/dev/null || true
+launchctl load "$GLOBE_PLIST"
+echo "  NOTE: the Karabiner rule below is now optional — enable it only if you"
+echo "  remove the listener, or both will react to Globe."
+
 # ── 9. Karabiner rule (file dropped into place; user must enable in GUI) ─────
 echo "Dropping Karabiner rule into ~/.config/karabiner/assets/complex_modifications/echo.json …"
 KARABINER_DIR="$HOME/.config/karabiner/assets/complex_modifications"

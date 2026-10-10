@@ -28,7 +28,7 @@ Hold Globe to record, release to paste a clean transcript at the cursor.
 
 **How it works:**
 1. A persistent Swift daemon (`record.app`) runs at login with CoreAudio pre-warmed, so the first hold captures audio from frame zero with no cold-start lag.
-2. Karabiner touches `/tmp/rewrite_record_start` on press and removes it on release. The daemon polls that flag every 50 ms and starts/stops `AVAudioRecorder` accordingly. It also captures the frontmost app name at press time so the paste lands where you started, even if focus drifts.
+2. The Globe listener (`globe_listener.swift`, an event tap installed by `setup.sh`; formerly a Karabiner rule) touches `/tmp/rewrite_record_start` on press and removes it on release. The daemon polls that flag every 50 ms and starts/stops `AVAudioRecorder` accordingly. It also captures the frontmost app name at press time so the paste lands where you started, even if focus drifts.
 3. On release, `dictate.py` uploads the m4a to OpenAI's `gpt-4o-mini-transcribe`.
 4. The transcript is sent to `gpt-4.1-mini` for prettification: filler words removed, punctuation added, run-on dictation turned into clean prose. Non-English speech is translated to English.
 5. **Voice commands** at the start of the transcript override the default behavior
