@@ -66,6 +66,12 @@ PROVISIONAL_PATH = "/tmp/rewrite_transcript.provisional"
 OPENAI_TRANSLATE_MODEL  = "whisper-1"
 OPENAI_TRANSCRIBE_MODEL = "gpt-4o-mini-transcribe"
 OPENAI_PRETTIFY_MODEL   = "gpt-4.1-mini"
+# Translation + tidy-up runs on Cerebras when a CEREBRAS_API_KEY is in .env:
+# gpt-oss-120b there answers far faster than gpt-4.1-mini does on OpenAI, and
+# this call is most of the wait between release and paste. OpenAI stays as the
+# fallback, so a Cerebras outage or quota error costs time, not the dictation.
+CEREBRAS_PRETTIFY_MODEL = "gpt-oss-120b"
+CEREBRAS_URL            = "https://api.cerebras.ai/v1/chat/completions"
 
 PRETTIFY_SYSTEM_PROMPT = (
     "You receive a raw speech-to-text transcript inside <transcript> tags.\n\n"
@@ -478,27 +484,53 @@ def vocabulary_note() -> str:
             + "\n".join(lines) + "\n</vocabulary>\n\n")
 
 
-def _prettify_call(text: str, api_key: str, system_prompt: str) -> str:
-    payload = {
-        "model": OPENAI_PRETTIFY_MODEL,
-        "max_tokens": 4096,
-        "messages": [
-            {"role": "system", "content": system_prompt},
-            {"role": "user",   "content": vocabulary_note()
-                                          + f"<transcript>\n{text}\n</transcript>"},
-        ],
-    }
+def _chat(url: str, key: str, payload: dict, timeout: float) -> str:
     req = urllib.request.Request(
-        "https://api.openai.com/v1/chat/completions",
+        url,
         data=json.dumps(payload).encode(),
         headers={
-            "Authorization": f"Bearer {api_key}",
+            "Authorization": f"Bearer {key}",
             "Content-Type":  "application/json",
+            # Cerebras sits behind Cloudflare, which refuses urllib's default
+            # user agent with a 403 (error 1010).
+            "User-Agent":    "Echo/1.0",
         },
     )
-    with urllib.request.urlopen(req, timeout=60) as resp:
+    with urllib.request.urlopen(req, timeout=timeout) as resp:
         data = json.load(resp)
         return data["choices"][0]["message"]["content"]
+
+
+def _prettify_call(text: str, api_key: str, system_prompt: str) -> str:
+    messages = [
+        {"role": "system", "content": system_prompt},
+        {"role": "user",   "content": vocabulary_note()
+                                      + f"<transcript>\n{text}\n</transcript>"},
+    ]
+    cerebras_key = load_env("CEREBRAS_API_KEY")
+    if cerebras_key:
+        try:
+            t = time.monotonic()
+            out = _chat(CEREBRAS_URL, cerebras_key, {
+                "model": CEREBRAS_PRETTIFY_MODEL,
+                "max_completion_tokens": 4096,
+                # A reasoning model: low effort keeps it to a short think,
+                # which is all a translation needs.
+                "reasoning_effort": "low",
+                "messages": messages,
+            }, timeout=20)
+            log(f"cerebras {CEREBRAS_PRETTIFY_MODEL}: {time.monotonic() - t:.2f}s")
+            if out and out.strip():
+                return out
+            log("cerebras returned nothing — falling back to OpenAI")
+        except Exception as e:
+            detail = e.read().decode()[:200] if isinstance(e, urllib.error.HTTPError) else str(e)
+            log(f"cerebras failed ({detail}) — falling back to OpenAI")
+    return _chat("https://api.openai.com/v1/chat/completions", api_key, {
+        "model": OPENAI_PRETTIFY_MODEL,
+        "max_tokens": 4096,
+        "messages": messages,
+    }, timeout=60)
 
 
 # ── OS glue ───────────────────────────────────────────────────────────────────
